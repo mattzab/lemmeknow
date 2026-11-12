@@ -46,6 +46,16 @@ Live subscribers are WebSockets that hibernate in a single `Hub` Durable Object:
 
 If you ever need more scale, shard the hub by topic hash and have multi-topic subscribers bridge to each shard.
 
-## D1 is the message cache
+## D1 is the message cache, packed one row per topic per hour
 
-Messages live in D1 for `cacheDurationSeconds` (12 h by default, the same as ntfy). D1 serves `poll`, `since=<id|time|duration|latest|all>`, the iOS `id=` fetch, and scheduled delivery. Ordering is `(time, insertion sequence)`, so `since=<id>` never skips or repeats messages that share a timestamp. A minute cron delivers due scheduled messages (claimed atomically with `UPDATE … RETURNING`) and prunes expired ones.
+Messages live in D1 for `cacheDurationSeconds` (12 h by default, the same as ntfy). D1 serves `poll`, `since=<id|time|duration|latest|all>`, the iOS `id=` fetch, and scheduled delivery.
+
+D1 bills per row read and written (and counts every index entry a write touches as another row written), so the cache is packed the way Richter packs check history: the `buckets` table holds **one row per topic per UTC hour**, keyed `(topic, hour, part)`, with a JSON array of entries `{ p, s, m }` (published flag, order key, the ntfy message). Scheduled messages sit in the bucket of their delivery hour with `p = 0`. With 12 h retention a topic has about 13 rows, however chatty it is.
+
+- **Publish** is one atomic `INSERT … ON CONFLICT DO UPDATE` that appends to the hour's array with `json_insert(entries, '$[#]', …)` and updates the bucket's counters (published count, min/max expiry, next due time). There is no read-modify-write, so concurrent publishes to the same topic cannot clobber a bucket, and no Durable Object round trip is needed to serialize them. A published message also bumps the topic's `message_count`/`last_message_at` in the same batch: two rows written per publish, no reads.
+- **Reads** (`poll`, `since`, the iOS `?poll=1&id=`, WebSocket replay, the dashboard log) load only the requested topics' bucket rows (narrowed by hour for `since=<time>`, and skipping future hours unless `scheduled=1`) and filter in memory. Ordering is `(time, s)`, where `s` is a microsecond-resolution insertion key, so `since=<id>` never skips or repeats messages that share a timestamp.
+- **Counts**: the dashboard's "cached" column and `/v1/stats` sum the per-bucket `published` counters. They never count messages one row at a time.
+- **Cron** (every minute): due scheduled messages are claimed by rewriting their bucket with a compare-and-swap on a `version` column that every write bumps, so a message is delivered exactly once even if a publish lands mid-rewrite (the cron re-reads and retries). Buckets whose newest message has expired are deleted. Expired entries in live buckets are skipped on read and only stripped once they are 10 minutes stale, which caps rewrites at a handful per bucket per hour.
+- **Size**: D1 caps a row at 2 MB. When an hour's bucket nears 1.5 MB, the append's `WHERE` clause refuses it and the message goes to `part` 1, 2, … of the same hour.
+- The table has no secondary indexes on purpose. The cron scans bucket metadata (a few rows per topic), which costs reads but saves an index write on every publish.
+- **Migration**: the first release stored one row per message. Schema migration 2 copies any such rows into buckets (keeping their order) and drops the old table.

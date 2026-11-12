@@ -19,6 +19,22 @@ CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, time, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires);
 CREATE INDEX IF NOT EXISTS idx_messages_due ON messages(published, time)
 `,
+	// 2: pack the cache into one row per topic per UTC hour (see docs/DECISIONS.md), copy any
+	// rows from the per-message table into buckets, then drop it. No secondary indexes on purpose:
+	// D1 bills every index entry a write touches as an extra row written.
+	`
+CREATE TABLE IF NOT EXISTS buckets (
+  topic TEXT NOT NULL, hour INTEGER NOT NULL, part INTEGER NOT NULL DEFAULT 0,
+  entries TEXT NOT NULL DEFAULT '[]', published INTEGER NOT NULL DEFAULT 0,
+  min_expires INTEGER NOT NULL, max_expires INTEGER NOT NULL, next_due INTEGER,
+  version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (topic, hour, part)) WITHOUT ROWID;
+INSERT OR IGNORE INTO buckets (topic, hour, part, entries, published, min_expires, max_expires, next_due, version)
+  SELECT topic, time / 3600, 0, json_group_array(json_object('p', published, 's', seq, 'm', json(body))), SUM(published),
+         MIN(expires), MAX(expires), MIN(CASE WHEN published = 0 THEN time END), 1
+  FROM (SELECT * FROM messages ORDER BY time, seq) GROUP BY topic, time / 3600;
+DROP TABLE IF EXISTS messages
+`,
 ];
 
 let migratedIsolate = false;
@@ -57,29 +73,93 @@ export function resetSchemaFlag() {
 	migratedIsolate = false;
 }
 
-// ---------- messages ----------
+// ---------- messages (packed: one row per topic per UTC hour) ----------
+//
+// D1 bills per row read and written, so the cache is packed like Richter's check history:
+// `buckets` holds one row per (topic, UTC hour) with a JSON array of entries
+// `{ p: published 0|1, s: order key, m: message }`. A publish is a single atomic UPSERT that
+// appends to the hour's array (no read-modify-write, so concurrent publishes cannot clobber
+// each other). The cron rewrites buckets with a compare-and-swap on `version`. Reads load the
+// handful of bucket rows for the requested topics and filter in memory. See docs/DECISIONS.md.
 
 export const POLL_LIMIT = 1000;
+/** Start a new part for the hour once a bucket's JSON nears this size (D1 caps a row at 2 MB). */
+export const MAX_BUCKET_BYTES = 1_500_000;
+/** Expired entries may linger this long in a live bucket before the cron rewrites it. */
+export const STRIP_SLACK_SECONDS = 600;
+const MAX_PARTS = 64;
+const CAS_RETRIES = 5;
 
-interface MessageRow {
-	seq: number;
-	id: string;
-	topic: string;
-	time: number;
-	expires: number;
-	published: number;
-	body: string;
+export interface CacheEntry {
+	p: 0 | 1;
+	s: number;
+	m: NtfyMessage;
 }
 
-const parse = (r: MessageRow): NtfyMessage => JSON.parse(r.body) as NtfyMessage;
+interface BucketRow {
+	topic: string;
+	hour: number;
+	part: number;
+	entries: string;
+	version: number;
+}
 
+export const hourOf = (t: number) => Math.floor(t / 3600);
+const expiresOf = (m: NtfyMessage) => m.expires ?? m.time;
+
+// Order key for messages that share a timestamp (ntfy uses time, then insertion order).
+let lastSeq = 0;
+function nextSeq(): number {
+	lastSeq = Math.max(lastSeq + 1, Date.now() * 1000);
+	return lastSeq;
+}
+
+const byOrder = (a: CacheEntry, b: CacheEntry) => a.m.time - b.m.time || a.s - b.s;
+
+function bucketMeta(entries: CacheEntry[]) {
+	let published = 0;
+	let min = Infinity;
+	let max = -Infinity;
+	let due: number | null = null;
+	for (const e of entries) {
+		const x = expiresOf(e.m);
+		if (x < min) min = x;
+		if (x > max) max = x;
+		if (e.p) published++;
+		else if (due === null || e.m.time < due) due = e.m.time;
+	}
+	return { published, min_expires: min, max_expires: max, next_due: due };
+}
+
+function appendStmt(db: D1Database, m: NtfyMessage, published: boolean, part: number): D1PreparedStatement {
+	const entry: CacheEntry = { p: published ? 1 : 0, s: nextSeq(), m };
+	const x = expiresOf(m);
+	return db
+		.prepare(
+			`INSERT INTO buckets (topic, hour, part, entries, published, min_expires, max_expires, next_due)
+VALUES (?, ?, ?, json_array(json(?)), ?, ?, ?, ?)
+ON CONFLICT (topic, hour, part) DO UPDATE SET
+  entries = json_insert(buckets.entries, '$[#]', json(excluded.entries -> '$[0]')),
+  published = buckets.published + excluded.published,
+  min_expires = MIN(buckets.min_expires, excluded.min_expires),
+  max_expires = MAX(buckets.max_expires, excluded.max_expires),
+  next_due = CASE WHEN excluded.next_due IS NULL THEN buckets.next_due WHEN buckets.next_due IS NULL THEN excluded.next_due ELSE MIN(buckets.next_due, excluded.next_due) END,
+  version = buckets.version + 1
+WHERE length(buckets.entries) + length(excluded.entries) < ${MAX_BUCKET_BYTES}`,
+		)
+		.bind(m.topic, hourOf(m.time), part, JSON.stringify(entry), published ? 1 : 0, x, x, published ? null : m.time);
+}
+
+/** Append a message to its topic's hour bucket: one row written (plus the topic counter when published). */
 export async function insertMessage(db: D1Database, m: NtfyMessage, published: boolean, now: number): Promise<void> {
-	await db.batch([
-		db
-			.prepare("INSERT INTO messages (id, topic, time, expires, published, body) VALUES (?, ?, ?, ?, ?, ?)")
-			.bind(m.id, m.topic, m.time, m.expires ?? m.time, published ? 1 : 0, JSON.stringify(m)),
-		...(published ? [touchTopicStmt(db, m.topic, now)] : []),
-	]);
+	const [first] = await db.batch([appendStmt(db, m, published, 0), ...(published ? [touchTopicStmt(db, m.topic, now)] : [])]);
+	if ((first.meta?.changes ?? 0) > 0) return;
+	// Part 0 of this hour is full: spill into the next part that has room.
+	for (let part = 1; part < MAX_PARTS; part++) {
+		const r = await appendStmt(db, m, published, part).run();
+		if ((r.meta?.changes ?? 0) > 0) return;
+	}
+	throw new Error(`message cache bucket for ${m.topic} is full`);
 }
 
 export function touchTopicStmt(db: D1Database, topic: string, now: number): D1PreparedStatement {
@@ -90,68 +170,144 @@ export function touchTopicStmt(db: D1Database, topic: string, now: number): D1Pr
 		.bind(topic, now, now);
 }
 
+/** Load bucket rows (oldest first) and flatten them into entries. */
+async function loadEntries(db: D1Database, where: string, args: unknown[], order = "hour ASC, part ASC"): Promise<CacheEntry[]> {
+	const { results } = await db.prepare(`SELECT topic, hour, part, entries, version FROM buckets WHERE ${where} ORDER BY ${order}`).bind(...args).all<BucketRow>();
+	const out: CacheEntry[] = [];
+	for (const r of results) for (const e of JSON.parse(r.entries) as CacheEntry[]) out.push(e);
+	return out;
+}
+
 /**
  * Cached messages for `topics` newer than `since` (ntfy sendOldMessages), oldest first.
  * Expired messages are never returned; scheduled (not yet delivered) ones only if `scheduled`.
+ * Reads only the requested topics' hour buckets (about one row per topic per cached hour).
  */
 export async function fetchCached(db: D1Database, topics: string[], since: Since, opts: { scheduled?: boolean; id?: string; now: number; limit?: number }): Promise<NtfyMessage[]> {
 	if (since.kind === "none" || topics.length === 0) return [];
 	const limit = opts.limit ?? POLL_LIMIT;
-	const ph = topics.map(() => "?").join(",");
-	const base = `topic IN (${ph}) AND expires > ?${opts.scheduled ? "" : " AND published = 1"}`;
+	let where = `topic IN (${topics.map(() => "?").join(",")}) AND max_expires > ?`;
 	const args: unknown[] = [...topics, opts.now];
-
-	if (opts.id) {
-		// Single-message poll (the iOS app's `?poll=1&id=<poll_id>`).
-		const { results } = await db.prepare(`SELECT * FROM messages WHERE id = ? AND ${base}`).bind(opts.id, ...args).all<MessageRow>();
-		return results.map(parse);
+	if (since.kind === "time" && !opts.id) {
+		where += " AND hour >= ?";
+		args.push(hourOf(since.time));
 	}
+	if (!opts.scheduled) {
+		// Published messages never sit in a future hour.
+		where += " AND hour <= ?";
+		args.push(hourOf(opts.now));
+	}
+	const all = (await loadEntries(db, where, args)).sort(byOrder);
+	const live = all.filter((e) => expiresOf(e.m) > opts.now && (opts.scheduled || e.p === 1));
+
+	if (opts.id) return live.filter((e) => e.m.id === opts.id).map((e) => e.m); // the iOS `?poll=1&id=`
+	let picked = live;
 	if (since.kind === "latest") {
-		const out: MessageRow[] = [];
-		for (const t of topics) {
-			const r = await db
-				.prepare(`SELECT * FROM messages WHERE topic = ? AND expires > ?${opts.scheduled ? "" : " AND published = 1"} ORDER BY time DESC, seq DESC LIMIT 1`)
-				.bind(t, opts.now)
-				.first<MessageRow>();
-			if (r) out.push(r);
-		}
-		return out.sort((a, b) => a.time - b.time || a.seq - b.seq).map(parse);
-	}
-	let where = base;
-	if (since.kind === "time") {
-		where += " AND time >= ?";
-		args.push(since.time);
+		const last = new Map<string, CacheEntry>();
+		for (const e of live) last.set(e.m.topic, e);
+		picked = [...last.values()].sort(byOrder);
+	} else if (since.kind === "time") {
+		picked = live.filter((e) => e.m.time >= since.time);
 	} else if (since.kind === "id") {
-		const marker = await db.prepare("SELECT time, seq FROM messages WHERE id = ?").bind(since.id).first<{ time: number; seq: number }>();
-		if (marker) {
-			where += " AND (time > ? OR (time = ? AND seq > ?))";
-			args.push(marker.time, marker.time, marker.seq);
-		}
+		const marker = all.find((e) => e.m.id === since.id);
+		if (marker) picked = live.filter((e) => byOrder(e, marker) > 0);
 	}
-	const { results } = await db
-		.prepare(`SELECT * FROM (SELECT * FROM messages WHERE ${where} ORDER BY time DESC, seq DESC LIMIT ?) ORDER BY time ASC, seq ASC`)
-		.bind(...args, limit)
-		.all<MessageRow>();
-	return results.map(parse);
+	return picked.slice(-limit).map((e) => e.m);
 }
 
-/** Claim scheduled messages that are due (atomically flips published), oldest first. */
+/**
+ * Rewrite one bucket with optimistic concurrency: re-read and retry if a publish appended in
+ * between (every write bumps `version`). An empty result deletes the row.
+ */
+async function rewriteBucket(db: D1Database, key: { topic: string; hour: number; part: number }, edit: (entries: CacheEntry[]) => CacheEntry[] | null): Promise<void> {
+	for (let attempt = 0; attempt < CAS_RETRIES; attempt++) {
+		const row = await db.prepare("SELECT topic, hour, part, entries, version FROM buckets WHERE topic = ? AND hour = ? AND part = ?").bind(key.topic, key.hour, key.part).first<BucketRow>();
+		if (!row) return;
+		const next = edit(JSON.parse(row.entries) as CacheEntry[]);
+		if (next === null) return; // nothing to change
+		let r: D1Result;
+		if (next.length === 0) {
+			r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND hour = ? AND part = ? AND version = ?").bind(key.topic, key.hour, key.part, row.version).run();
+		} else {
+			const meta = bucketMeta(next);
+			r = await db
+				.prepare("UPDATE buckets SET entries = ?, published = ?, min_expires = ?, max_expires = ?, next_due = ?, version = version + 1 WHERE topic = ? AND hour = ? AND part = ? AND version = ?")
+				.bind(JSON.stringify(next), meta.published, meta.min_expires, meta.max_expires, meta.next_due, key.topic, key.hour, key.part, row.version)
+				.run();
+		}
+		if ((r.meta?.changes ?? 0) > 0) return;
+	}
+	throw new Error(`bucket ${key.topic}/${key.hour}/${key.part} kept changing; will retry next cron`);
+}
+
+/** Claim scheduled messages that are due (flips `p` with a compare-and-swap, so exactly once), oldest first. */
 export async function claimDueMessages(db: D1Database, now: number): Promise<NtfyMessage[]> {
-	const { results } = await db.prepare("UPDATE messages SET published = 1 WHERE published = 0 AND time <= ? RETURNING *").bind(now).all<MessageRow>();
-	if (results.length) await db.batch(results.map((r) => touchTopicStmt(db, r.topic, now)));
-	return results.sort((a, b) => a.time - b.time || a.seq - b.seq).map(parse);
+	const { results } = await db.prepare("SELECT topic, hour, part FROM buckets WHERE next_due IS NOT NULL AND next_due <= ?").bind(now).all<{ topic: string; hour: number; part: number }>();
+	const claimed: CacheEntry[] = [];
+	for (const key of results) {
+		let mine: CacheEntry[] = [];
+		await rewriteBucket(db, key, (entries) => {
+			mine = [];
+			const next = entries.map((e) => {
+				if (e.p === 0 && e.m.time <= now) {
+					const flipped: CacheEntry = { ...e, p: 1 };
+					mine.push(flipped);
+					return flipped;
+				}
+				return e;
+			});
+			return mine.length ? next : null;
+		});
+		claimed.push(...mine);
+	}
+	if (claimed.length) await db.batch(claimed.map((e) => touchTopicStmt(db, e.m.topic, now)));
+	return claimed.sort(byOrder).map((e) => e.m);
 }
 
+/**
+ * Cron cleanup: delete hour buckets whose messages have all expired, and strip expired entries
+ * from live buckets once they are STRIP_SLACK_SECONDS stale (reads already skip them). Returns
+ * the number of messages removed.
+ */
 export async function pruneExpired(db: D1Database, now: number): Promise<number> {
-	const r = await db.prepare("DELETE FROM messages WHERE expires <= ?").bind(now).run();
-	return r.meta?.changes ?? 0;
+	const { results } = await db
+		.prepare("SELECT topic, hour, part, version, max_expires, json_array_length(entries) AS n FROM buckets WHERE min_expires <= ?")
+		.bind(now)
+		.all<{ topic: string; hour: number; part: number; version: number; max_expires: number; n: number }>();
+	let removed = 0;
+	for (const b of results) {
+		if (b.max_expires <= now) {
+			const r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND hour = ? AND part = ? AND version = ?").bind(b.topic, b.hour, b.part, b.version).run();
+			if ((r.meta?.changes ?? 0) > 0) {
+				removed += b.n;
+				continue;
+			}
+		}
+		let stripped = 0;
+		await rewriteBucket(db, b, (entries) => {
+			stripped = 0;
+			const keep = entries.filter((e) => expiresOf(e.m) > now);
+			if (keep.length === entries.length) return null;
+			// Only pay for a rewrite once the oldest expired entry is past the slack window.
+			const oldest = Math.min(...entries.filter((e) => expiresOf(e.m) <= now).map((e) => expiresOf(e.m)));
+			if (keep.length && oldest > now - STRIP_SLACK_SECONDS) return null;
+			stripped = entries.length - keep.length;
+			return keep;
+		});
+		removed += stripped;
+	}
+	return removed;
 }
 
 export async function recentMessages(db: D1Database, opts: { topic?: string; limit: number; now: number }): Promise<(NtfyMessage & { published: boolean })[]> {
-	const where = opts.topic ? "WHERE topic = ? AND expires > ?" : "WHERE expires > ?";
+	const where = opts.topic ? "topic = ? AND max_expires > ?" : "max_expires > ?";
 	const args: unknown[] = opts.topic ? [opts.topic, opts.now] : [opts.now];
-	const { results } = await db.prepare(`SELECT * FROM messages ${where} ORDER BY time DESC, seq DESC LIMIT ?`).bind(...args, opts.limit).all<MessageRow>();
-	return results.map((r) => ({ ...parse(r), published: r.published === 1 }));
+	const entries = await loadEntries(db, where, args);
+	return entries
+		.filter((e) => expiresOf(e.m) > opts.now)
+		.sort((a, b) => byOrder(b, a))
+		.slice(0, opts.limit)
+		.map((e) => ({ ...e.m, published: e.p === 1 }));
 }
 
 // ---------- topics ----------
@@ -182,7 +338,8 @@ const topicInfo = (r: TopicRow, subscribers = 0): TopicInfo => ({
 export async function listTopics(db: D1Database, now: number, subscribers: Record<string, number> = {}): Promise<TopicInfo[]> {
 	const { results } = await db
 		.prepare(
-			"SELECT t.*, (SELECT COUNT(*) FROM messages m WHERE m.topic = t.name AND m.expires > ?) AS cached FROM topics t ORDER BY COALESCE(t.last_message_at, t.created_at) DESC",
+			// `cached` sums the per-bucket counters (a few rows per topic); never a per-message scan.
+			"SELECT t.*, (SELECT COALESCE(SUM(b.published), 0) FROM buckets b WHERE b.topic = t.name AND b.max_expires > ?) AS cached FROM topics t ORDER BY COALESCE(t.last_message_at, t.created_at) DESC",
 		)
 		.bind(now)
 		.all<TopicRow>();
@@ -204,7 +361,7 @@ export async function upsertTopic(db: D1Database, t: { name: string; description
 }
 
 export async function deleteTopic(db: D1Database, name: string): Promise<void> {
-	await db.batch([db.prepare("DELETE FROM messages WHERE topic = ?").bind(name), db.prepare("DELETE FROM topics WHERE name = ?").bind(name)]);
+	await db.batch([db.prepare("DELETE FROM buckets WHERE topic = ?").bind(name), db.prepare("DELETE FROM topics WHERE name = ?").bind(name)]);
 }
 
 /** Anonymous permissions for the given topics (missing topics have none). */
@@ -278,7 +435,8 @@ export async function touchToken(db: D1Database, id: string, now: number): Promi
 	await db.prepare("UPDATE tokens SET last_used_at = ? WHERE id = ?").bind(now, id).run();
 }
 
+/** Cached message count from the bucket counters (expired entries count until the cron strips them). */
 export async function countMessages(db: D1Database, now: number): Promise<number> {
-	const r = await db.prepare("SELECT COUNT(*) AS n FROM messages WHERE expires > ? AND published = 1").bind(now).first<{ n: number }>();
+	const r = await db.prepare("SELECT COALESCE(SUM(published), 0) AS n FROM buckets WHERE max_expires > ?").bind(now).first<{ n: number }>();
 	return r?.n ?? 0;
 }
