@@ -35,6 +35,30 @@ INSERT OR IGNORE INTO buckets (topic, hour, part, entries, published, min_expire
   FROM (SELECT * FROM messages ORDER BY time, seq) GROUP BY topic, time / 3600;
 DROP TABLE IF EXISTS messages
 `,
+	// 3: re-key buckets from UTC hour to UTC day. Hour buckets are merged into day buckets in
+	// (hour, part, position) order, keeping each entry (and its published flag) as is. A new part
+	// starts whenever the hour buckets merged so far reach 400 KB, so a merged row stays under
+	// 400 KB + one 1.5 MB hour bucket, inside D1's 2 MB row limit.
+	`
+CREATE TABLE IF NOT EXISTS buckets_v3 (
+  topic TEXT NOT NULL, day INTEGER NOT NULL, part INTEGER NOT NULL DEFAULT 0,
+  entries TEXT NOT NULL DEFAULT '[]', published INTEGER NOT NULL DEFAULT 0,
+  min_expires INTEGER NOT NULL, max_expires INTEGER NOT NULL, next_due INTEGER,
+  version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (topic, day, part)) WITHOUT ROWID;
+INSERT OR IGNORE INTO buckets_v3 (topic, day, part, entries, published, min_expires, max_expires, next_due, version)
+  SELECT topic, day, grp, json_group_array(json(e)), SUM(p), MIN(mn), MAX(mx), MIN(nd), 1
+  FROM (
+    SELECT b.topic AS topic, b.hour / 24 AS day, b.grp AS grp, j.value AS e, json_extract(j.value, '$.p') AS p,
+           b.min_expires AS mn, b.max_expires AS mx, b.next_due AS nd
+    FROM (SELECT *, (SUM(length(entries)) OVER (PARTITION BY topic, hour / 24 ORDER BY hour, part) - length(entries)) / 400000 AS grp FROM buckets) AS b,
+         json_each(b.entries) AS j
+    ORDER BY b.topic, b.hour / 24, b.grp, b.hour, b.part, j.key
+  )
+  GROUP BY topic, day, grp;
+DROP TABLE buckets;
+ALTER TABLE buckets_v3 RENAME TO buckets
+`,
 ];
 
 let migratedIsolate = false;
@@ -68,26 +92,27 @@ export async function ensureSchema(db: D1Database): Promise<void> {
 	migratedIsolate = true;
 }
 
-/** For tests: forget that this isolate already migrated. */
+/** For tests: forget that this isolate already migrated (and any cached bucket part hints). */
 export function resetSchemaFlag() {
 	migratedIsolate = false;
+	partHint.clear();
 }
 
-// ---------- messages (packed: one row per topic per UTC hour) ----------
+// ---------- messages (packed: one row per topic per UTC day) ----------
 //
 // D1 bills per row read and written, so the cache is packed like Richter's check history:
-// `buckets` holds one row per (topic, UTC hour) with a JSON array of entries
+// `buckets` holds one row per (topic, UTC day) with a JSON array of entries
 // `{ p: published 0|1, s: order key, m: message }`. A publish is a single atomic UPSERT that
-// appends to the hour's array (no read-modify-write, so concurrent publishes cannot clobber
+// appends to the day's array (no read-modify-write, so concurrent publishes cannot clobber
 // each other). The cron rewrites buckets with a compare-and-swap on `version`. Reads load the
 // handful of bucket rows for the requested topics and filter in memory. See docs/DECISIONS.md.
 
 export const POLL_LIMIT = 1000;
-/** Start a new part for the hour once a bucket's JSON nears this size (D1 caps a row at 2 MB). */
+/** Start a new part for the day once a bucket's JSON nears this size (D1 caps a row at 2 MB). */
 export const MAX_BUCKET_BYTES = 1_500_000;
 /** Expired entries may linger this long in a live bucket before the cron rewrites it. */
-export const STRIP_SLACK_SECONDS = 600;
-const MAX_PARTS = 64;
+export const STRIP_SLACK_SECONDS = 3600;
+const MAX_PARTS = 256;
 const CAS_RETRIES = 5;
 
 export interface CacheEntry {
@@ -98,13 +123,14 @@ export interface CacheEntry {
 
 interface BucketRow {
 	topic: string;
-	hour: number;
+	day: number;
 	part: number;
 	entries: string;
 	version: number;
 }
 
-export const hourOf = (t: number) => Math.floor(t / 3600);
+export const dayOf = (t: number) => Math.floor(t / 86400);
+const partHint = new Map<string, number>();
 const expiresOf = (m: NtfyMessage) => m.expires ?? m.time;
 
 // Order key for messages that share a timestamp (ntfy uses time, then insertion order).
@@ -136,9 +162,9 @@ function appendStmt(db: D1Database, m: NtfyMessage, published: boolean, part: nu
 	const x = expiresOf(m);
 	return db
 		.prepare(
-			`INSERT INTO buckets (topic, hour, part, entries, published, min_expires, max_expires, next_due)
+			`INSERT INTO buckets (topic, day, part, entries, published, min_expires, max_expires, next_due)
 VALUES (?, ?, ?, json_array(json(?)), ?, ?, ?, ?)
-ON CONFLICT (topic, hour, part) DO UPDATE SET
+ON CONFLICT (topic, day, part) DO UPDATE SET
   entries = json_insert(buckets.entries, '$[#]', json(excluded.entries -> '$[0]')),
   published = buckets.published + excluded.published,
   min_expires = MIN(buckets.min_expires, excluded.min_expires),
@@ -147,17 +173,25 @@ ON CONFLICT (topic, hour, part) DO UPDATE SET
   version = buckets.version + 1
 WHERE length(buckets.entries) + length(excluded.entries) < ${MAX_BUCKET_BYTES}`,
 		)
-		.bind(m.topic, hourOf(m.time), part, JSON.stringify(entry), published ? 1 : 0, x, x, published ? null : m.time);
+		.bind(m.topic, dayOf(m.time), part, JSON.stringify(entry), published ? 1 : 0, x, x, published ? null : m.time);
 }
 
-/** Append a message to its topic's hour bucket: one row written (plus the topic counter when published). */
+/** Append a message to its topic's day bucket: one row written (plus the topic counter when published). */
 export async function insertMessage(db: D1Database, m: NtfyMessage, published: boolean, now: number): Promise<void> {
-	const [first] = await db.batch([appendStmt(db, m, published, 0), ...(published ? [touchTopicStmt(db, m.topic, now)] : [])]);
+	// Start at the last part this isolate saw accept a write for the day, so a busy day that has
+	// overflowed does not retry every full part on each publish.
+	const key = `${m.topic}\u0000${dayOf(m.time)}`;
+	const start = partHint.get(key) ?? 0;
+	const [first] = await db.batch([appendStmt(db, m, published, start), ...(published ? [touchTopicStmt(db, m.topic, now)] : [])]);
 	if ((first.meta?.changes ?? 0) > 0) return;
-	// Part 0 of this hour is full: spill into the next part that has room.
-	for (let part = 1; part < MAX_PARTS; part++) {
+	// That part is full: spill into the next part that has room.
+	for (let part = start + 1; part < MAX_PARTS; part++) {
 		const r = await appendStmt(db, m, published, part).run();
-		if ((r.meta?.changes ?? 0) > 0) return;
+		if ((r.meta?.changes ?? 0) > 0) {
+			if (partHint.size > 10_000) partHint.clear();
+			partHint.set(key, part);
+			return;
+		}
 	}
 	throw new Error(`message cache bucket for ${m.topic} is full`);
 }
@@ -171,8 +205,8 @@ export function touchTopicStmt(db: D1Database, topic: string, now: number): D1Pr
 }
 
 /** Load bucket rows (oldest first) and flatten them into entries. */
-async function loadEntries(db: D1Database, where: string, args: unknown[], order = "hour ASC, part ASC"): Promise<CacheEntry[]> {
-	const { results } = await db.prepare(`SELECT topic, hour, part, entries, version FROM buckets WHERE ${where} ORDER BY ${order}`).bind(...args).all<BucketRow>();
+async function loadEntries(db: D1Database, where: string, args: unknown[], order = "day ASC, part ASC"): Promise<CacheEntry[]> {
+	const { results } = await db.prepare(`SELECT topic, day, part, entries, version FROM buckets WHERE ${where} ORDER BY ${order}`).bind(...args).all<BucketRow>();
 	const out: CacheEntry[] = [];
 	for (const r of results) for (const e of JSON.parse(r.entries) as CacheEntry[]) out.push(e);
 	return out;
@@ -181,7 +215,7 @@ async function loadEntries(db: D1Database, where: string, args: unknown[], order
 /**
  * Cached messages for `topics` newer than `since` (ntfy sendOldMessages), oldest first.
  * Expired messages are never returned; scheduled (not yet delivered) ones only if `scheduled`.
- * Reads only the requested topics' hour buckets (about one row per topic per cached hour).
+ * Reads only the requested topics' day buckets (about one row per topic per cached day).
  */
 export async function fetchCached(db: D1Database, topics: string[], since: Since, opts: { scheduled?: boolean; id?: string; now: number; limit?: number }): Promise<NtfyMessage[]> {
 	if (since.kind === "none" || topics.length === 0) return [];
@@ -189,13 +223,13 @@ export async function fetchCached(db: D1Database, topics: string[], since: Since
 	let where = `topic IN (${topics.map(() => "?").join(",")}) AND max_expires > ?`;
 	const args: unknown[] = [...topics, opts.now];
 	if (since.kind === "time" && !opts.id) {
-		where += " AND hour >= ?";
-		args.push(hourOf(since.time));
+		where += " AND day >= ?";
+		args.push(dayOf(since.time));
 	}
 	if (!opts.scheduled) {
-		// Published messages never sit in a future hour.
-		where += " AND hour <= ?";
-		args.push(hourOf(opts.now));
+		// Published messages never sit in a future day.
+		where += " AND day <= ?";
+		args.push(dayOf(opts.now));
 	}
 	const all = (await loadEntries(db, where, args)).sort(byOrder);
 	const live = all.filter((e) => expiresOf(e.m) > opts.now && (opts.scheduled || e.p === 1));
@@ -219,30 +253,30 @@ export async function fetchCached(db: D1Database, topics: string[], since: Since
  * Rewrite one bucket with optimistic concurrency: re-read and retry if a publish appended in
  * between (every write bumps `version`). An empty result deletes the row.
  */
-async function rewriteBucket(db: D1Database, key: { topic: string; hour: number; part: number }, edit: (entries: CacheEntry[]) => CacheEntry[] | null): Promise<void> {
+async function rewriteBucket(db: D1Database, key: { topic: string; day: number; part: number }, edit: (entries: CacheEntry[]) => CacheEntry[] | null): Promise<void> {
 	for (let attempt = 0; attempt < CAS_RETRIES; attempt++) {
-		const row = await db.prepare("SELECT topic, hour, part, entries, version FROM buckets WHERE topic = ? AND hour = ? AND part = ?").bind(key.topic, key.hour, key.part).first<BucketRow>();
+		const row = await db.prepare("SELECT topic, day, part, entries, version FROM buckets WHERE topic = ? AND day = ? AND part = ?").bind(key.topic, key.day, key.part).first<BucketRow>();
 		if (!row) return;
 		const next = edit(JSON.parse(row.entries) as CacheEntry[]);
 		if (next === null) return; // nothing to change
 		let r: D1Result;
 		if (next.length === 0) {
-			r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND hour = ? AND part = ? AND version = ?").bind(key.topic, key.hour, key.part, row.version).run();
+			r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND day = ? AND part = ? AND version = ?").bind(key.topic, key.day, key.part, row.version).run();
 		} else {
 			const meta = bucketMeta(next);
 			r = await db
-				.prepare("UPDATE buckets SET entries = ?, published = ?, min_expires = ?, max_expires = ?, next_due = ?, version = version + 1 WHERE topic = ? AND hour = ? AND part = ? AND version = ?")
-				.bind(JSON.stringify(next), meta.published, meta.min_expires, meta.max_expires, meta.next_due, key.topic, key.hour, key.part, row.version)
+				.prepare("UPDATE buckets SET entries = ?, published = ?, min_expires = ?, max_expires = ?, next_due = ?, version = version + 1 WHERE topic = ? AND day = ? AND part = ? AND version = ?")
+				.bind(JSON.stringify(next), meta.published, meta.min_expires, meta.max_expires, meta.next_due, key.topic, key.day, key.part, row.version)
 				.run();
 		}
 		if ((r.meta?.changes ?? 0) > 0) return;
 	}
-	throw new Error(`bucket ${key.topic}/${key.hour}/${key.part} kept changing; will retry next cron`);
+	throw new Error(`bucket ${key.topic}/${key.day}/${key.part} kept changing; will retry next cron`);
 }
 
 /** Claim scheduled messages that are due (flips `p` with a compare-and-swap, so exactly once), oldest first. */
 export async function claimDueMessages(db: D1Database, now: number): Promise<NtfyMessage[]> {
-	const { results } = await db.prepare("SELECT topic, hour, part FROM buckets WHERE next_due IS NOT NULL AND next_due <= ?").bind(now).all<{ topic: string; hour: number; part: number }>();
+	const { results } = await db.prepare("SELECT topic, day, part FROM buckets WHERE next_due IS NOT NULL AND next_due <= ?").bind(now).all<{ topic: string; day: number; part: number }>();
 	const claimed: CacheEntry[] = [];
 	for (const key of results) {
 		let mine: CacheEntry[] = [];
@@ -265,19 +299,19 @@ export async function claimDueMessages(db: D1Database, now: number): Promise<Ntf
 }
 
 /**
- * Cron cleanup: delete hour buckets whose messages have all expired, and strip expired entries
+ * Cron cleanup: delete day buckets whose messages have all expired, and strip expired entries
  * from live buckets once they are STRIP_SLACK_SECONDS stale (reads already skip them). Returns
  * the number of messages removed.
  */
 export async function pruneExpired(db: D1Database, now: number): Promise<number> {
 	const { results } = await db
-		.prepare("SELECT topic, hour, part, version, max_expires, json_array_length(entries) AS n FROM buckets WHERE min_expires <= ?")
+		.prepare("SELECT topic, day, part, version, max_expires, json_array_length(entries) AS n FROM buckets WHERE min_expires <= ?")
 		.bind(now)
-		.all<{ topic: string; hour: number; part: number; version: number; max_expires: number; n: number }>();
+		.all<{ topic: string; day: number; part: number; version: number; max_expires: number; n: number }>();
 	let removed = 0;
 	for (const b of results) {
 		if (b.max_expires <= now) {
-			const r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND hour = ? AND part = ? AND version = ?").bind(b.topic, b.hour, b.part, b.version).run();
+			const r = await db.prepare("DELETE FROM buckets WHERE topic = ? AND day = ? AND part = ? AND version = ?").bind(b.topic, b.day, b.part, b.version).run();
 			if ((r.meta?.changes ?? 0) > 0) {
 				removed += b.n;
 				continue;

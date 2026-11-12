@@ -3,7 +3,7 @@ import type { NtfyMessage } from "../src/shared/types";
 import { newMessage } from "../src/worker/ntfy/message";
 import { parseSince, parseSubscribeParams, passesFilters, topicsFromPath } from "../src/worker/ntfy/subscribe";
 import { Params } from "../src/worker/ntfy/util";
-import { claimDueMessages, fetchCached, insertMessage, pruneExpired } from "../src/worker/store";
+import { STRIP_SLACK_SECONDS, claimDueMessages, fetchCached, insertMessage, pruneExpired } from "../src/worker/store";
 import { fakeEnv } from "./helpers";
 
 const NOW = 1_800_000_000;
@@ -106,6 +106,8 @@ describe("cache replay (poll / since / id)", () => {
 		expect(await claimDueMessages(s.env.DB, NOW)).toEqual([]);
 		expect(ids(await claimDueMessages(s.env.DB, NOW + 600))).toEqual([s.later.id]);
 		expect(await claimDueMessages(s.env.DB, NOW + 700)).toEqual([]);
-		expect(await pruneExpired(s.env.DB, NOW)).toBe(1);
+		// Expired entries in a live day bucket are skipped on read and stripped once STRIP_SLACK_SECONDS stale.
+		expect(await pruneExpired(s.env.DB, NOW)).toBe(0);
+		expect(await pruneExpired(s.env.DB, NOW + STRIP_SLACK_SECONDS)).toBe(5); // everything but the scheduled one has expired by then
 	});
 });
