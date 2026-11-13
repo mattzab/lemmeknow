@@ -58,7 +58,7 @@ export default defineConfig({
 			notFoundHandling: "single-page-application",
 			// The PWA (/, /sw.js, manifest, icons, /assets/*) is plain static content. The Worker runs
 			// only for the APIs, the Access-gated dashboard, and the health probe.
-			runWorkerFirst: ["/api/*", "/admin", "/admin/*", "/admin.html", "/login", "/access/*", "/healthz"],
+			runWorkerFirst: ["/api/*", "/admin", "/admin/*", "/admin.html", "/login", "/access/*", "/healthz", "/lk_*", "/tk_*"],
 		},
 		domains: [cfg.host],
 		workersDev: false,

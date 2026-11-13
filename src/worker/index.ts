@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { admin } from "./admin";
-import { api } from "./api";
+import { URL_TOKEN_RE } from "@shared/curl";
+import { api, short } from "./api";
 import { type Env, VERSION } from "./env";
 import { me } from "./me";
 import { evalKeys, evaluateAccess, personFromRequest } from "./people";
@@ -15,6 +16,7 @@ import { ensureSchema } from "./store";
  *   /admin, /admin/*  dashboard HTML, only for a verified Access identity with the admin role
  *   /login         behind Access: starts the e-mail login, then sends people back to /
  *   /access/evaluate, /access/keys   public: Cloudflare Access External Evaluation (who is invited)
+ *   /<token>/<topic>  short publish URL (first segment lk_… or tk_…) → api.ts `short`
  *   /healthz       liveness probe
  * Everything else (/, /sw.js, /manifest.webmanifest, icons, /assets/*) is the public PWA,
  * served straight from static assets without running the Worker.
@@ -89,6 +91,13 @@ const dashboard = async (c: { req: { raw: Request }; env: Env }) => {
 app.get("/admin", dashboard);
 app.get("/admin/*", dashboard);
 app.get("/admin.html", (c) => c.redirect("/admin", 302));
+
+// Short publish URLs. Only a token-shaped first segment gets here, so /admin, /login, /api,
+// /access, /healthz and every static asset keep their own routes.
+app.use("/:token/*", async (c, next) => {
+	if (!URL_TOKEN_RE.test(c.req.param("token"))) return c.env.ASSETS.fetch(c.req.raw);
+	return short.fetch(c.req.raw, c.env, c.executionCtx);
+});
 
 app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 

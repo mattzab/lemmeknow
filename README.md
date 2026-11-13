@@ -5,8 +5,8 @@
 Push notifications to your phone from your own Cloudflare account. Lemmeknow is a small Worker, a D1 database and an installable web app (PWA). Scripts publish over a simple HTTP API, and the Worker delivers each message with standard **Web Push** to every phone that subscribed.
 
 ```sh
-curl -H "Authorization: Bearer lk_..." -d "Nightly backup finished" \
-  "https://lemmeknow.example.com/api/v1/topics/backups/messages?title=Backup"
+curl -fsS -m 10 --retry 3 --data-raw 'Nightly backup finished' \
+  'https://lemmeknow.example.com/lk_your_token/backups?title=Backup'
 ```
 
 - **Nothing to install from an app store.** iPhone (iOS 16.4+) and Android open your deployment's URL and add it to the Home Screen.
@@ -34,6 +34,28 @@ script ──POST /api/v1/topics/alerts/messages──▶ Worker ──▶ D1 (i
 4. Tapping the notification opens its link, or the Lemmeknow inbox.
 
 The Web Push implementation (`src/worker/webpush.ts`) uses only Web Crypto. It is tested against the RFC 8291 example vector.
+
+## Publish URL
+
+The quickest way to publish is a URL with the token and topic in it, like a heartbeat URL:
+
+```
+https://<host>/<token>/<topic>
+```
+
+GET, HEAD, POST and PUT all publish (the token needs write access to the topic). Options go in the query: `title`, `body` (or `msg`), `url`, `priority`, `tags`. A POST/PUT body is the message text, or a JSON object as in the API below. With no message at all it sends "Ping". The answer is `201 { ok, id, topic, devices }`.
+
+```sh
+# from a script
+curl -fsS -m 10 --retry 3 --data-raw 'Disk is 90% full' 'https://lemmeknow.example.com/lk_your_token/alerts?title=Disk&priority=4'
+
+# GET only, e.g. from cron or an uptime monitor
+curl -fsS -m 10 --retry 3 'https://lemmeknow.example.com/lk_your_token/backups?body=Backup%20done'
+```
+
+The dashboard's **Curl** page (and *Curl* in the signed-in app) builds these with your real host, token and topic, with one-tap copy and a **Send it now** button.
+
+The token is part of the URL, so it can end up in shell history, cron mail, proxy and access logs, and Cloudflare's own request logs. Use a token that can only write to the topics it needs, and revoke it if it leaks. Link previewers (chat apps unfurling a pasted URL) also fetch with GET, which publishes. To keep the token out of URLs, use the header API instead.
 
 ## API
 

@@ -1,6 +1,7 @@
 import type { PushSubscriptionJSON } from "@shared/types";
-import { Hono } from "hono";
-import { AuthError, authorize, bearerToken, hashToken } from "./auth";
+import { type Context, Hono } from "hono";
+import { URL_TOKEN_RE } from "@shared/curl";
+import { AuthError, authorize, authorizeToken, bearerToken, hashToken } from "./auth";
 import { type Env, VERSION } from "./env";
 import { buildMessage, InputError, type PublishInput, publish, retentionSeconds, vapidSubject } from "./service";
 import { meInfo, normCode, resolvePerson } from "./people";
@@ -39,13 +40,14 @@ api.options("*", (c) =>
 	}),
 );
 
-api.onError((e, c) => {
+function onApiError(e: Error, c: Context) {
 	if (e instanceof AuthError) return c.json({ error: e.message }, e.status);
 	if (e instanceof InputError) return c.json({ error: e.message, ...(e.field ? { field: e.field } : {}) }, 400);
 	if (e instanceof TooManySubscriptions) return c.json({ error: e.message }, 409);
-	console.error(JSON.stringify({ event: "api_error", path: c.req.path, error: (e as Error).message }));
+	console.error(JSON.stringify({ event: "api_error", error: (e as Error).message }));
 	return c.json({ error: "Internal error" }, 500);
-});
+}
+api.onError(onApiError);
 
 api.get("/health", (c) => c.json({ ok: true, version: VERSION }));
 
@@ -168,3 +170,47 @@ api.get("/me", async (c) => {
 });
 
 api.all("*", (c) => c.json({ error: "Not found" }, 404));
+
+/**
+ * The short publish URL: `/<token>/<topic>`, like a heartbeat URL. Any of GET, HEAD, POST, PUT
+ * publishes. Options come from the query (`title`, `body`/`msg`/`message`, `url`, `priority`,
+ * `tags`); a POST/PUT body is the text, or a JSON object like /api/v1. With neither, "Ping".
+ * Only paths whose first segment looks like a token reach this (see index.ts and runWorkerFirst).
+ */
+export const short = new Hono<{ Bindings: Env }>();
+short.onError(onApiError);
+short.use("*", async (c, next) => {
+	await next();
+	c.header("access-control-allow-origin", "*");
+	c.header("cache-control", "no-store");
+	c.header("referrer-policy", "no-referrer");
+	c.header("x-robots-tag", "noindex");
+});
+
+const shortPublish = async (c: Context<{ Bindings: Env }>) => {
+	const token = c.req.param("token") ?? "";
+	if (!URL_TOKEN_RE.test(token)) return c.json({ error: "Not found" }, 404);
+	const topic = topicParam(c.req.param("topic") ?? "");
+	const now = nowSec();
+	await authorizeToken(c.env.DB, token, topic, "write", now, (p) => c.executionCtx.waitUntil(p));
+	const q = c.req.query();
+	let input: PublishInput = { title: q.title, body: q.body ?? q.msg ?? q.message, url: q.url, priority: q.priority, tags: q.tags };
+	if (c.req.method === "POST" || c.req.method === "PUT") {
+		const isJson = (c.req.header("content-type") ?? "").toLowerCase().includes("application/json");
+		if (isJson) {
+			const j = await readJson<PublishInput>(c.req.raw);
+			if (typeof j !== "object" || j === null || Array.isArray(j)) throw new InputError("Body must be a JSON object.");
+			input = { ...input, ...Object.fromEntries(Object.entries(j).filter(([, v]) => v !== undefined && v !== null && v !== "")) };
+		} else {
+			const text = (await readBody(c.req.raw)).trim();
+			if (text) input.body = text;
+		}
+	}
+	if (!input.body && !input.title) input.body = "Ping";
+	const m = buildMessage(topic, input, now, retentionSeconds(c.env));
+	const { devices } = await publish(c.env, (p) => c.executionCtx.waitUntil(p), m, vapidSubject(c.env, c.req.raw));
+	return c.json({ ok: true, id: m.id, topic, devices }, 201);
+};
+
+for (const path of ["/:token/:topic", "/:token/:topic/"]) short.on(["GET", "POST", "PUT"], path, shortPublish);
+short.options("/:token/:topic", (c) => c.body(null, 204, { "access-control-allow-methods": "GET, POST, PUT, OPTIONS", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" }));

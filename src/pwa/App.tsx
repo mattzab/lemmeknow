@@ -1,5 +1,5 @@
 import type { MeInfo, Message } from "@shared/types";
-import { Bell, BellOff, BellRing, Check, ExternalLink, Inbox, PlusCircle, RefreshCw, Send, Share, SquarePlus, Trash2, TriangleAlert } from "lucide-react";
+import { Bell, BellOff, BellRing, Check, Terminal, ExternalLink, Inbox, PlusCircle, RefreshCw, Send, Share, SquarePlus, Trash2, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Logo } from "@/components/logo";
 import { Badge, TagChip } from "@/components/ui/badge";
@@ -8,6 +8,7 @@ import { Card } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/input";
 import { ago, dateTime, PRIORITY_LABEL } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { CurlBuilder } from "@/components/curl-builder";
 import { AccountCard, AccountChip, LoginCard } from "./Account";
 import { api, ApiError, currentSubscription, ensurePushSubscription, isAndroid, isIOS, isStandalone, loadAccount, loadSaved, permission, pushSupported, type SavedTopic, sessionMe, storeAccount, storeSaved } from "./push";
 
@@ -467,6 +468,27 @@ export default function App() {
 						</div>
 					</details>
 				</Card>
+
+				{account && (
+					<Card className="p-5">
+						<details>
+							<summary className="flex cursor-pointer list-none items-center gap-2 font-semibold">
+								<Terminal className="size-4 text-primary" /> Curl: notify from a script
+								<span className="ml-auto text-xs font-normal text-primary">Build</span>
+							</summary>
+							<p className="mt-1 text-sm text-muted-foreground">A URL with your token and topic in it. Anything that fetches it sends a notification.</p>
+							<div className="mt-4">
+								<CurlBuilder
+									compact
+									baseUrl={location.origin}
+									topics={account.topics.filter((t) => t.can_write).map((t) => t.name)}
+									tokens={[{ id: "me", label: "Your token", token: account.token, grants: account.grants }]}
+									preferTokenId="me"
+								/>
+							</div>
+						</details>
+					</Card>
+				)}
 
 				<section>
 					<div className="mb-2 flex items-center">

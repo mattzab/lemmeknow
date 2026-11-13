@@ -1,5 +1,5 @@
 import type { ServerInfo } from "@shared/types";
-import { BookOpen, Hash, KeyRound, LogOut, type LucideIcon, MessagesSquare, Moon, Search, Smartphone, Sun, Users } from "lucide-react";
+import { BookOpen, Hash, KeyRound, LogOut, type LucideIcon, MessagesSquare, Moon, Search, Smartphone, Sun, Terminal, Users } from "lucide-react";
 import { createContext, useContext } from "react";
 import { Link, Redirect, Route, Router, Switch, useLocation } from "wouter";
 import { Logo } from "@/components/logo";
@@ -12,12 +12,14 @@ import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 import { MessagesPage } from "./pages/MessagesPage";
 import { ConnectPage } from "./pages/ConnectPage";
+import { CurlPage } from "./pages/CurlPage";
 import { TokensPage } from "./pages/TokensPage";
 import { TopicsPage } from "./pages/TopicsPage";
 import { UsersPage } from "./pages/UsersPage";
 
 const NAV: { href: string; label: string; icon: LucideIcon }[] = [
 	{ href: "/topics", label: "Topics", icon: Hash },
+	{ href: "/curl", label: "Curl", icon: Terminal },
 	{ href: "/messages", label: "Messages", icon: MessagesSquare },
 	{ href: "/tokens", label: "Tokens", icon: KeyRound },
 	{ href: "/users", label: "Users", icon: Users },
@@ -131,6 +133,7 @@ export default function App() {
 												<Redirect to="/topics" replace />
 											</Route>
 											<Route path="/topics" component={TopicsPage} />
+											<Route path="/curl" component={CurlPage} />
 											<Route path="/messages" component={MessagesPage} />
 											<Route path="/tokens" component={TokensPage} />
 											<Route path="/users" component={UsersPage} />

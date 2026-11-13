@@ -59,7 +59,11 @@ export interface AuthResult {
  *   unknown/expired token → 401; no token on a private topic, or a token without the grant → 403.
  */
 export async function authorize(db: D1Database, req: Request, topic: string, perm: Permission, now: number, waitUntil?: (p: Promise<unknown>) => void): Promise<AuthResult> {
-	const token = bearerToken(req);
+	return authorizeToken(db, bearerToken(req), topic, perm, now, waitUntil);
+}
+
+/** Same as authorize, for a token that came from somewhere other than the header (the publish URL). */
+export async function authorizeToken(db: D1Database, token: string | null, topic: string, perm: Permission, now: number, waitUntil?: (p: Promise<unknown>) => void): Promise<AuthResult> {
 	if (!token) {
 		if ((await publicPermissions(db, topic))[perm]) return { tokenId: null };
 		throw new AuthError(403, `This topic is private: send a token with ${perm} access.`);
