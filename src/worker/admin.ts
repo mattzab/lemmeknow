@@ -48,6 +48,8 @@ admin.onError((e, c) => {
 });
 
 admin.get("/me", async (c) => {
+	// Make sure the admin has a personal token, so the Curl page has one to offer.
+	await ensurePersonalToken(c.env, c.get("person"));
 	const info: ServerInfo = {
 		baseUrl: baseUrlFor(c.env, c.req.raw),
 		retentionSeconds: retentionSeconds(c.env),
