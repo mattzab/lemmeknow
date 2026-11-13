@@ -12,6 +12,12 @@ import { CurlBuilder } from "@/components/curl-builder";
 import { AccountCard, AccountChip, LoginCard } from "./Account";
 import { api, ApiError, currentSubscription, ensurePushSubscription, isAndroid, isIOS, isStandalone, loadAccount, loadSaved, permission, pushSupported, type SavedTopic, sessionMe, storeAccount, storeSaved } from "./push";
 
+/**
+ * Top padding that clears the iPhone status bar and the Liquid Glass fade under it: the safe-area
+ * inset plus ~40% more (about 1.2-1.5rem on notched phones). Desktop has no inset, so 1rem.
+ */
+const SAFE_TOP = "max(1rem, calc(env(safe-area-inset-top, 0px) * 1.4))";
+
 type Notice = { kind: "ok" | "error"; text: string } | null;
 
 function useNow(ms: number) {
@@ -372,7 +378,7 @@ export default function App() {
 	}
 
 	return (
-		<div className="mx-auto min-h-dvh max-w-xl px-4 pb-10" style={{ paddingTop: "max(env(safe-area-inset-top), 1rem)" }}>
+		<div className="mx-auto min-h-dvh max-w-xl px-4 pb-10" style={{ paddingTop: SAFE_TOP }}>
 			<header className="flex items-center gap-2 py-3">
 				<Logo />
 				<span className="text-lg font-semibold tracking-tight">Lemmeknow</span>

@@ -47,6 +47,17 @@ describe("short publish URL /<token>/<topic>", () => {
 		expect(j).toMatchObject({ title: "J", body: "from json", url: "https://example.com" });
 	});
 
+	it("accepts Richter's webhook JSON; down is high priority", async () => {
+		const s = await setup();
+		const down = { title: "Backups is down", body: "No ping for 25h", status: "down", name: "Backups", url: "https://richter.example/checks/1", time: "2026-11-12T00:00:00Z" };
+		const res = await s.call(`/${s.rw}/alerts`, json(down));
+		expect(res.status).toBe(201);
+		expect((await s.call(`/${s.rw}/alerts`, json({ ...down, title: "Backups is up", body: "Back", status: "up" }))).status).toBe(201);
+		const [up, d] = await s.inbox();
+		expect(d).toMatchObject({ title: "Backups is down", body: "No ping for 25h", url: "https://richter.example/checks/1", priority: 4 });
+		expect(up).toMatchObject({ title: "Backups is up", priority: 3 });
+	});
+
 	it("rejects unknown tokens, read-only tokens and bad input", async () => {
 		const s = await setup();
 		expect((await s.call(`/lk_${"x".repeat(32)}/alerts`)).status).toBe(401);

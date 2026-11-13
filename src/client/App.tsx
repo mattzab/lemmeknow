@@ -33,7 +33,8 @@ function Header({ me }: { me?: ServerInfo }) {
 	const [location] = useLocation();
 	const { theme, toggle } = useTheme();
 	return (
-		<header className="sticky top-0 z-40 border-b bg-background/85 backdrop-blur-md">
+		// The inset term is 0 on desktop; on iPhone it clears the status bar and the Liquid Glass fade.
+		<header className="sticky top-0 z-40 border-b bg-background/85 backdrop-blur-md" style={{ paddingTop: "calc(env(safe-area-inset-top, 0px) * 1.4)" }}>
 			<div className="mx-auto flex h-14 max-w-[1400px] items-center gap-4 px-4 sm:px-6">
 				<Link href="/topics" className="flex items-center gap-2 font-semibold tracking-tight">
 					<Logo />

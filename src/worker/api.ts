@@ -200,7 +200,12 @@ const shortPublish = async (c: Context<{ Bindings: Env }>) => {
 		if (isJson) {
 			const j = await readJson<PublishInput>(c.req.raw);
 			if (typeof j !== "object" || j === null || Array.isArray(j)) throw new InputError("Body must be a JSON object.");
-			input = { ...input, ...Object.fromEntries(Object.entries(j).filter(([, v]) => v !== undefined && v !== null && v !== "")) };
+			// Known fields only, so webhook senders (e.g. Richter: { title, body, status, name, url, time }) just work.
+			const r = j as PublishInput & { status?: unknown; name?: unknown };
+			for (const k of ["title", "body", "url", "priority", "tags"] as const) if (r[k] !== undefined && r[k] !== null && r[k] !== "") input[k] = r[k];
+			if (!input.title && typeof r.name === "string") input.title = r.name;
+			// A monitor reporting "down" is worth a high-priority notification unless told otherwise.
+			if ((input.priority === undefined || input.priority === "") && typeof r.status === "string" && /^(down|fail(ed|ure)?|error)$/i.test(r.status)) input.priority = 4;
 		} else {
 			const text = (await readBody(c.req.raw)).trim();
 			if (text) input.body = text;
