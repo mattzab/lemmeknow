@@ -3,12 +3,24 @@ import { Hono } from "hono";
 import { type AccessIdentity, authenticate } from "./access";
 import { generateToken, hashToken, TOKEN_PREFIX } from "./auth";
 import { type Env, VERSION } from "./env";
-import { hub } from "./hub";
-import { NtfyError } from "./ntfy/errors";
-import { parsePublish } from "./ntfy/publish";
-import { isValidTopic, nowSec, Params, randomString } from "./ntfy/util";
-import { baseUrlFor, cacheDurationSeconds, deliver } from "./service";
-import { deleteToken, deleteTopic, getTopic, insertToken, listTokens, listTopics, recentMessages, tokenInfo, updateToken, upsertTopic } from "./store";
+import { baseUrlFor, buildMessage, fanOut, InputError, publish, retentionSeconds, vapidSubject } from "./service";
+import {
+	deleteToken,
+	deleteTopic,
+	getSubscriptions,
+	getTopic,
+	getVapidKeys,
+	insertMessage,
+	insertToken,
+	listMessages,
+	listTokens,
+	listTopics,
+	removeSubscriptionsByToken,
+	tokenInfo,
+	updateToken,
+	upsertTopic,
+} from "./store";
+import { isValidTopic, nowSec, randomString } from "./util";
 
 type Vars = { identity: AccessIdentity };
 export const admin = new Hono<{ Bindings: Env; Variables: Vars }>();
@@ -19,40 +31,38 @@ admin.use("*", async (c, next) => {
 	if (!id) return c.json({ error: "Cloudflare Access authentication required" }, 401);
 	c.set("identity", id);
 	await next();
+	c.header("cache-control", "no-store");
 });
 
 const bad = (error: string, field?: string) => ({ error, ...(field ? { field } : {}) });
 
-admin.get("/me", (c) => {
+admin.onError((e, c) => {
+	if (e instanceof InputError) return c.json(bad(e.message, e.field), 400);
+	console.error(JSON.stringify({ event: "admin_error", path: c.req.path, error: (e as Error).message }));
+	return c.json(bad("Internal error"), 500);
+});
+
+admin.get("/me", async (c) => {
 	const info: ServerInfo = {
 		baseUrl: baseUrlFor(c.env, c.req.raw),
-		upstreamBaseUrl: c.env.UPSTREAM_BASE_URL ?? "",
-		upstreamEnabled: !!c.env.UPSTREAM_BASE_URL,
-		cacheDurationSeconds: cacheDurationSeconds(c.env),
+		retentionSeconds: retentionSeconds(c.env),
 		email: c.get("identity").email,
 		version: VERSION,
+		vapidPublicKey: (await getVapidKeys(c.env.DB)).publicKey,
 	};
 	return c.json(info);
 });
 
 // ---------- topics ----------
 
-async function subscriberCounts(env: Env): Promise<Record<string, number>> {
-	try {
-		return await hub(env).subscriberCounts();
-	} catch {
-		return {};
-	}
-}
-
-admin.get("/topics", async (c) => c.json(await listTopics(c.env.DB, nowSec(), await subscriberCounts(c.env))));
+admin.get("/topics", async (c) => c.json(await listTopics(c.env.DB, nowSec())));
 
 admin.post("/topics", async (c) => {
-	const b = await c.req.json<{ name?: string; description?: string; anon_read?: boolean; anon_write?: boolean }>();
+	const b = await c.req.json<{ name?: string; description?: string; public_read?: boolean; public_write?: boolean }>();
 	const name = (b.name ?? "").trim();
-	if (!isValidTopic(name)) return c.json(bad("Topic names are 1-64 letters, digits, - or _, and not a reserved word (admin, api, assets, v1, ...).", "name"), 400);
+	if (!isValidTopic(name)) return c.json(bad("Topic names are 1-64 letters, digits, - or _, and not a reserved word (admin, api, assets, ...).", "name"), 400);
 	if (await getTopic(c.env.DB, name)) return c.json(bad("That topic already exists.", "name"), 409);
-	await upsertTopic(c.env.DB, { name, description: b.description?.trim() ?? "", anon_read: !!b.anon_read, anon_write: !!b.anon_write }, nowSec());
+	await upsertTopic(c.env.DB, { name, description: b.description?.trim() ?? "", public_read: !!b.public_read, public_write: !!b.public_write }, nowSec());
 	return c.json(await getTopic(c.env.DB, name), 201);
 });
 
@@ -60,10 +70,10 @@ admin.patch("/topics/:name", async (c) => {
 	const name = c.req.param("name");
 	const cur = await getTopic(c.env.DB, name);
 	if (!cur) return c.json(bad("Topic not found"), 404);
-	const b = await c.req.json<{ description?: string; anon_read?: boolean; anon_write?: boolean }>();
+	const b = await c.req.json<{ description?: string; public_read?: boolean; public_write?: boolean }>();
 	await upsertTopic(
 		c.env.DB,
-		{ name, description: b.description ?? cur.description, anon_read: b.anon_read ?? cur.anon_read, anon_write: b.anon_write ?? cur.anon_write },
+		{ name, description: b.description ?? cur.description, public_read: b.public_read ?? cur.public_read, public_write: b.public_write ?? cur.public_write },
 		cur.created_at,
 	);
 	return c.json(await getTopic(c.env.DB, name));
@@ -72,6 +82,12 @@ admin.patch("/topics/:name", async (c) => {
 admin.delete("/topics/:name", async (c) => {
 	await deleteTopic(c.env.DB, c.req.param("name"));
 	return c.json({ ok: true });
+});
+
+/** Devices subscribed to a topic (endpoint host only: the full endpoint is a capability URL). */
+admin.get("/topics/:name/devices", async (c) => {
+	const subs = await getSubscriptions(c.env.DB, c.req.param("name"));
+	return c.json(subs.map((s) => ({ id: s.id, push_service: new URL(s.endpoint).host, created_at: s.created_at, token_id: s.token_id })));
 });
 
 // ---------- tokens ----------
@@ -130,8 +146,11 @@ admin.patch("/tokens/:id", async (c) => {
 });
 
 admin.delete("/tokens/:id", async (c) => {
-	await deleteToken(c.env.DB, c.req.param("id"));
-	return c.json({ ok: true });
+	const id = c.req.param("id");
+	await deleteToken(c.env.DB, id);
+	// Devices that subscribed with this token stop receiving pushes too.
+	const devices = await removeSubscriptionsByToken(c.env.DB, id);
+	return c.json({ ok: true, devices_removed: devices });
 });
 
 // ---------- messages ----------
@@ -139,28 +158,24 @@ admin.delete("/tokens/:id", async (c) => {
 admin.get("/messages", async (c) => {
 	const topic = c.req.query("topic") || undefined;
 	const limit = Math.min(500, Math.max(1, Number(c.req.query("limit") ?? 100) || 100));
-	return c.json(await recentMessages(c.env.DB, { topic, limit, now: nowSec() }));
+	return c.json(await listMessages(c.env.DB, { topics: topic ? [topic] : undefined, limit, now: nowSec() }));
 });
 
-/** Send a message from the dashboard (no token needed: the caller passed Access). */
+/**
+ * Send a notification from the dashboard (no token needed: the caller passed Access).
+ * `wait: true` pushes inline and returns per-device results, for the "Send test" button.
+ */
 admin.post("/publish", async (c) => {
-	const b = await c.req.json<{ topic?: string; message?: string; title?: string; priority?: number; tags?: string; click?: string; markdown?: boolean }>();
-	const h = new Headers();
-	if (b.title) h.set("x-title", b.title);
-	if (b.priority) h.set("x-priority", String(b.priority));
-	if (b.tags) h.set("x-tags", b.tags);
-	if (b.click) h.set("x-click", b.click);
-	if (b.markdown) h.set("x-markdown", "yes");
-	try {
-		const parsed = parsePublish(new Params(h, new URLSearchParams()), (b.topic ?? "").trim(), new TextEncoder().encode(b.message ?? ""), {
-			cacheDurationSeconds: cacheDurationSeconds(c.env),
-		});
-		await deliver(c.env, (p) => c.executionCtx.waitUntil(p), parsed, baseUrlFor(c.env, c.req.raw));
-		return c.json(parsed.message);
-	} catch (e) {
-		if (e instanceof NtfyError) return c.json(bad(e.message), e.http as 400);
-		throw e;
+	const b = await c.req.json<{ topic?: string; title?: string; body?: string; url?: string; priority?: number; tags?: string | string[]; wait?: boolean }>();
+	const now = nowSec();
+	const m = buildMessage((b.topic ?? "").trim(), b, now, retentionSeconds(c.env));
+	const subject = vapidSubject(c.env, c.req.raw);
+	if (b.wait) {
+		await insertMessage(c.env.DB, m, now);
+		return c.json({ message: m, push: await fanOut(c.env, m, subject) });
 	}
+	const { devices } = await publish(c.env, (p) => c.executionCtx.waitUntil(p), m, subject);
+	return c.json({ message: m, devices });
 });
 
 admin.all("*", (c) => c.json({ error: "Not found" }, 404));

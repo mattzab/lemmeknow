@@ -18,8 +18,8 @@ import { useApi, useDocumentTitle } from "@/lib/hooks";
 import { ago } from "@/lib/format";
 import { SendDialog } from "./SendDialog";
 
-type Draft = { name: string; description: string; anon_read: boolean; anon_write: boolean };
-const EMPTY: Draft = { name: "", description: "", anon_read: false, anon_write: false };
+type Draft = { name: string; description: string; public_read: boolean; public_write: boolean };
+const EMPTY: Draft = { name: "", description: "", public_read: false, public_write: false };
 
 export function TopicsPage() {
 	useDocumentTitle("Topics · Lemmeknow");
@@ -40,7 +40,7 @@ export function TopicsPage() {
 			async () => {
 				try {
 					return edit.existing
-						? await admin.patch(`/topics/${encodeURIComponent(d.name)}`, { description: d.description, anon_read: d.anon_read, anon_write: d.anon_write })
+						? await admin.patch(`/topics/${encodeURIComponent(d.name)}`, { description: d.description, public_read: d.public_read, public_write: d.public_write })
 						: await admin.post("/topics", d);
 				} catch (e) {
 					setErr((e as Error).message);
@@ -56,7 +56,7 @@ export function TopicsPage() {
 	};
 
 	const remove = async (t: TopicInfo) => {
-		if (!(await confirm({ title: `Delete topic "${t.name}"?`, description: "Cached messages are deleted. Tokens keep their grants, and publishing to the name again recreates it.", confirmLabel: "Delete", destructive: true }))) return;
+		if (!(await confirm({ title: `Delete topic "${t.name}"?`, description: "Its messages and device subscriptions are deleted. Tokens keep their grants, and publishing to the name again recreates it.", confirmLabel: "Delete", destructive: true }))) return;
 		await run("del", () => admin.del(`/topics/${encodeURIComponent(t.name)}`), "Topic deleted");
 		void topics.reload();
 	};
@@ -65,7 +65,7 @@ export function TopicsPage() {
 		<>
 			<PageHeader
 				title="Topics"
-				description="Topics are created when you add them here or on first publish. Access is granted per token; anonymous access is off unless you enable it on a topic."
+				description="Topics are created when you add them here or on first publish. Access is granted per token; topics are private unless you make one public."
 				actions={
 					<>
 						<Button variant="outline" onClick={() => setSend("")}>
@@ -85,15 +85,15 @@ export function TopicsPage() {
 						<TableSkeleton rows={4} cols={6} />
 					) : topics.data.length === 0 ? (
 						<EmptyState icon={Hash} title="No topics yet" action={<Button onClick={() => setEdit({ draft: EMPTY, existing: false })}><Plus /> New topic</Button>}>
-							Create a topic, mint a token for it, then subscribe from the ntfy app.
+							Create a topic, mint a token for it, then subscribe from the Lemmeknow app on your phone (see Connect).
 						</EmptyState>
 					) : (
 						<Table>
 							<thead className="border-b">
 								<tr>
 									<Th>Topic</Th>
-									<Th>Subscribers</Th>
-									<Th>Cached</Th>
+									<Th>Devices</Th>
+									<Th>Stored</Th>
 									<Th>Published</Th>
 									<Th>Last message</Th>
 									<Th className="text-right">Actions</Th>
@@ -105,10 +105,10 @@ export function TopicsPage() {
 										<Td>
 											<div className="flex items-center gap-2">
 												<span className="font-mono text-sm font-medium">{t.name}</span>
-												{(t.anon_read || t.anon_write) && (
-													<Tooltip content={`Anonymous ${[t.anon_read && "read", t.anon_write && "write"].filter(Boolean).join(" + ")} allowed`}>
+												{(t.public_read || t.public_write) && (
+													<Tooltip content={`Public ${[t.public_read && "read", t.public_write && "write"].filter(Boolean).join(" + ")}: no token needed`}>
 														<Badge className="border-amber-500/40 text-amber-600 dark:text-amber-400">
-															<Globe className="size-3" /> public {t.anon_read && t.anon_write ? "rw" : t.anon_read ? "r" : "w"}
+															<Globe className="size-3" /> public {t.public_read && t.public_write ? "rw" : t.public_read ? "r" : "w"}
 														</Badge>
 													</Tooltip>
 												)}
@@ -116,14 +116,14 @@ export function TopicsPage() {
 											{t.description && <p className="mt-0.5 text-xs text-muted-foreground">{t.description}</p>}
 										</Td>
 										<Td>
-											<span className={t.subscribers ? "font-medium text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}>{t.subscribers}</span>
+											<span className={t.devices ? "font-medium text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}>{t.devices}</span>
 										</Td>
-										<Td className="tabular-nums">{t.cached}</Td>
+										<Td className="tabular-nums">{t.stored}</Td>
 										<Td className="tabular-nums">{t.message_count}</Td>
 										<Td className="text-muted-foreground">{ago(t.last_message_at)}</Td>
 										<Td className="text-right">
 											<div className="inline-flex gap-1">
-												<Tooltip content="Send a test message">
+												<Tooltip content="Send a test notification">
 													<Button variant="ghost" size="icon-sm" onClick={() => setSend(t.name)}>
 														<Send />
 													</Button>
@@ -132,7 +132,7 @@ export function TopicsPage() {
 													<Button
 														variant="ghost"
 														size="icon-sm"
-														onClick={() => (setErr(undefined), setEdit({ draft: { name: t.name, description: t.description, anon_read: t.anon_read, anon_write: t.anon_write }, existing: true }))}
+														onClick={() => (setErr(undefined), setEdit({ draft: { name: t.name, description: t.description, public_read: t.public_read, public_write: t.public_write }, existing: true }))}
 													>
 														<Pencil />
 													</Button>
@@ -174,16 +174,16 @@ export function TopicsPage() {
 								</Field>
 								<div className="rounded-md border p-3">
 									<SwitchRow
-										label="Anonymous read"
-										description="Anyone with the URL can subscribe without a token."
-										checked={edit.draft.anon_read}
-										onCheckedChange={(v) => setEdit({ ...edit, draft: { ...edit.draft, anon_read: v } })}
+										label="Public read"
+										description="Anyone who knows the topic name can read its inbox and get notifications, without a token."
+										checked={edit.draft.public_read}
+										onCheckedChange={(v) => setEdit({ ...edit, draft: { ...edit.draft, public_read: v } })}
 									/>
 									<SwitchRow
-										label="Anonymous write"
-										description="Anyone with the URL can publish without a token."
-										checked={edit.draft.anon_write}
-										onCheckedChange={(v) => setEdit({ ...edit, draft: { ...edit.draft, anon_write: v } })}
+										label="Public write"
+										description="Anyone who knows the topic name can publish without a token."
+										checked={edit.draft.public_write}
+										onCheckedChange={(v) => setEdit({ ...edit, draft: { ...edit.draft, public_write: v } })}
 									/>
 								</div>
 							</DialogBody>

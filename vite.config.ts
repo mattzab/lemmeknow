@@ -6,4 +6,14 @@ import { defineConfig } from "vite";
 export default defineConfig({
 	plugins: [react(), tailwindcss(), cloudflare()],
 	resolve: { alias: { "@shared": "/src/shared", "@": "/src/client" } },
+	environments: {
+		client: {
+			build: {
+				rollupOptions: {
+					// index.html is the public PWA; admin.html is the Access-gated dashboard.
+					input: { app: "index.html", admin: "admin.html" },
+				},
+			},
+		},
+	},
 });

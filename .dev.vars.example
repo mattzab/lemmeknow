@@ -1,4 +1,0 @@
-# Local secrets for `npx cf dev`. Copy to .dev.vars (gitignored). Never commit real values.
-# Optional: ntfy.sh access token, sent as Bearer auth on upstream poll_request wakeups
-# (only needed if you hit ntfy.sh's anonymous rate limits).
-UPSTREAM_ACCESS_TOKEN=

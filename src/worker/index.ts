@@ -1,13 +1,20 @@
 import { Hono } from "hono";
 import { authenticate } from "./access";
 import { admin } from "./admin";
-import type { Env } from "./env";
-import { handleNtfy } from "./ntfy-api";
+import { api } from "./api";
+import { type Env, VERSION } from "./env";
 import { runScheduled } from "./service";
 import { ensureSchema } from "./store";
 
-export { Hub } from "./hub";
-
+/**
+ * Routing (see cloudflare.config.ts → assets.runWorkerFirst):
+ *   /api/v1/*      public Lemmeknow API (token auth)            → api.ts
+ *   /api/admin/*   dashboard API (Cloudflare Access JWT)        → admin.ts
+ *   /admin, /admin/*  dashboard HTML, only for a verified Access identity
+ *   /healthz       liveness probe
+ * Everything else (/, /sw.js, /manifest.webmanifest, icons, /assets/*) is the public PWA,
+ * served straight from static assets without running the Worker.
+ */
 const app = new Hono<{ Bindings: Env }>();
 
 app.use("*", async (c, next) => {
@@ -15,18 +22,18 @@ app.use("*", async (c, next) => {
 	await next();
 });
 
-app.get("/healthz", (c) => c.json({ ok: true, at: Date.now() }));
+app.get("/healthz", (c) => c.json({ ok: true, version: VERSION, at: Date.now() }));
 
-// Dashboard API: Cloudflare Access in front, JWT verified again inside (admin.ts).
+app.route("/api/v1", api);
 app.route("/api/admin", admin);
 app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
 
-// Dashboard SPA under /admin. The HTML is only served to a verified Access identity.
-const spa = async (c: { req: { raw: Request }; env: Env }) => {
+const dashboard = async (c: { req: { raw: Request }; env: Env }) => {
 	if (!(await authenticate(c.req.raw, c.env))) {
 		return new Response("Cloudflare Access authentication required for the Lemmeknow dashboard.\n", { status: 401, headers: { "content-type": "text/plain" } });
 	}
-	const res = await c.env.ASSETS.fetch(new Request(new URL("/", c.req.raw.url), { headers: c.req.raw.headers }));
+	// `/admin` resolves to admin.html in the asset bundle (html_handling: auto-trailing-slash).
+	const res = await c.env.ASSETS.fetch(new Request(new URL("/admin", c.req.raw.url), { headers: c.req.raw.headers }));
 	const out = new Response(res.body, res);
 	out.headers.set("x-frame-options", "DENY");
 	out.headers.set("x-content-type-options", "nosniff");
@@ -34,22 +41,17 @@ const spa = async (c: { req: { raw: Request }; env: Env }) => {
 	out.headers.set("cache-control", "no-store");
 	return out;
 };
-app.get("/admin", spa);
-app.get("/admin/*", spa);
-app.get("/", (c) => c.redirect("/admin", 302));
+app.get("/admin", dashboard);
+app.get("/admin/*", dashboard);
+app.get("/admin.html", (c) => c.redirect("/admin", 302));
 
-// Everything else is the ntfy protocol (publish, subscribe, poll, health, config).
-app.all("*", async (c) => {
-	const res = await handleNtfy(c.req.raw, c.env, c.executionCtx);
-	if (res) return res;
-	return c.json({ code: 40401, http: 404, error: "page not found" }, 404, { "access-control-allow-origin": "*" });
-});
+app.all("*", (c) => c.env.ASSETS.fetch(c.req.raw));
 
 export default {
 	fetch: app.fetch,
-	async scheduled(_event, env, ctx) {
+	async scheduled(_event, env) {
 		await ensureSchema(env.DB);
-		const r = await runScheduled(env, (p) => ctx.waitUntil(p));
-		if (r.delivered || r.pruned) console.log(`cron: delivered ${r.delivered} scheduled, pruned ${r.pruned} expired`);
+		const r = await runScheduled(env);
+		if (r.pruned) console.log(JSON.stringify({ event: "cron_prune", pruned: r.pruned }));
 	},
 } satisfies ExportedHandler<Env>;

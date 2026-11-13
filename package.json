@@ -1,8 +1,8 @@
 {
 	"name": "lemmeknow",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"private": true,
-	"description": "A Cloudflare-native, ntfy-compatible push notification server (Workers + Durable Objects + D1).",
+	"description": "Self-hosted push notifications on Cloudflare: a Worker, D1, and an installable web app with Web Push.",
 	"license": "MIT",
 	"type": "module",
 	"scripts": {

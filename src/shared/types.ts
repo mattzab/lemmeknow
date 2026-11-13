@@ -1,48 +1,24 @@
-/** Wire types shared by the Worker and the dashboard. Field names follow ntfy's JSON API. */
+/** Wire types shared by the Worker, the dashboard, and the PWA. */
 
-export type MessageEvent = "open" | "keepalive" | "message" | "poll_request";
+export type Priority = 1 | 2 | 3 | 4 | 5;
 
-export interface NtfyAction {
+/** A Lemmeknow notification as stored, listed, and pushed. Times are Unix seconds. */
+export interface Message {
 	id: string;
-	action: "view" | "broadcast" | "http" | "copy";
-	label: string;
-	clear: boolean;
-	url?: string;
-	method?: string;
-	headers?: Record<string, string>;
-	body?: string;
-	intent?: string;
-	extras?: Record<string, string>;
-	value?: string;
-}
-
-export interface NtfyAttachment {
-	name: string;
-	type?: string;
-	size?: number;
-	expires?: number;
-	url: string;
-}
-
-/** A message as ntfy serializes it (see binwiederhier/ntfy model.Message). */
-export interface NtfyMessage {
-	id: string;
-	time: number;
-	expires?: number;
-	event: MessageEvent;
 	topic: string;
+	time: number;
+	expires: number;
 	title?: string;
-	message?: string;
-	priority?: number;
+	body: string;
+	/** Opened when the notification is tapped. */
+	url?: string;
+	/** 1 (min) to 5 (urgent). 3 is the default. */
+	priority: Priority;
 	tags?: string[];
-	click?: string;
-	icon?: string;
-	actions?: NtfyAction[];
-	attachment?: NtfyAttachment;
-	poll_id?: string;
-	content_type?: string;
-	encoding?: string;
 }
+
+/** What the service worker receives in each Web Push payload. */
+export type PushPayload = Pick<Message, "id" | "topic" | "time" | "title" | "body" | "url" | "priority" | "tags">;
 
 export interface Grant {
 	/** Topic name or pattern with `*` wildcards (e.g. `alerts_*`, `*`). */
@@ -64,24 +40,36 @@ export interface TokenInfo {
 export interface TopicInfo {
 	name: string;
 	description: string;
-	anon_read: boolean;
-	anon_write: boolean;
+	/** Anyone can read (inbox + push subscribe) without a token. Off by default. */
+	public_read: boolean;
+	/** Anyone can publish without a token. Off by default. */
+	public_write: boolean;
 	created_at: number;
 	last_message_at: number | null;
 	message_count: number;
-	cached: number;
-	subscribers: number;
+	/** Messages still within the retention window. */
+	stored: number;
+	/** Web Push subscriptions (devices) on this topic. */
+	devices: number;
 }
 
 export interface ServerInfo {
 	baseUrl: string;
-	upstreamBaseUrl: string;
-	upstreamEnabled: boolean;
-	cacheDurationSeconds: number;
+	retentionSeconds: number;
 	email: string;
 	version: string;
+	vapidPublicKey: string;
 }
 
-export interface StoredMessage extends NtfyMessage {
-	published: boolean;
+/** `PushSubscription.toJSON()` as the browser produces it. */
+export interface PushSubscriptionJSON {
+	endpoint: string;
+	expirationTime?: number | null;
+	keys: { p256dh: string; auth: string };
+}
+
+/** Errors from every Lemmeknow API: `{ error, field? }` with a matching HTTP status. */
+export interface ApiErrorBody {
+	error: string;
+	field?: string;
 }

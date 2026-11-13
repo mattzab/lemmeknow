@@ -1,5 +1,5 @@
 import type { ServerInfo } from "@shared/types";
-import { BookOpen, Hash, KeyRound, LogOut, type LucideIcon, MessagesSquare, Moon, Search, Sun } from "lucide-react";
+import { BookOpen, Hash, KeyRound, LogOut, type LucideIcon, MessagesSquare, Moon, Search, Smartphone, Sun } from "lucide-react";
 import { createContext, useContext } from "react";
 import { Link, Redirect, Route, Router, Switch, useLocation } from "wouter";
 import { Logo } from "@/components/logo";
@@ -11,7 +11,7 @@ import { useApi, useDocumentTitle } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 import { MessagesPage } from "./pages/MessagesPage";
-import { SetupPage } from "./pages/SetupPage";
+import { ConnectPage } from "./pages/ConnectPage";
 import { TokensPage } from "./pages/TokensPage";
 import { TopicsPage } from "./pages/TopicsPage";
 
@@ -19,7 +19,7 @@ const NAV: { href: string; label: string; icon: LucideIcon }[] = [
 	{ href: "/topics", label: "Topics", icon: Hash },
 	{ href: "/messages", label: "Messages", icon: MessagesSquare },
 	{ href: "/tokens", label: "Tokens", icon: KeyRound },
-	{ href: "/setup", label: "App setup", icon: BookOpen },
+	{ href: "/connect", label: "Connect", icon: BookOpen },
 ];
 
 const ServerCtx = createContext<ServerInfo | null>(null);
@@ -54,6 +54,12 @@ function Header({ me }: { me?: ServerInfo }) {
 					})}
 				</nav>
 				<div className="ml-auto flex items-center gap-1.5">
+					<Tooltip content="Open the Lemmeknow web app (install it on your phone from here)" side="bottom">
+						<a href="/" className="flex h-8 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground hover:bg-accent hover:text-foreground">
+							<Smartphone className="size-4" />
+							<span className="hidden sm:inline">Open app</span>
+						</a>
+					</Tooltip>
 					<Tooltip content={theme === "dark" ? "Light mode" : "Dark mode"} side="bottom">
 						<button
 							type="button"
@@ -125,7 +131,7 @@ export default function App() {
 											<Route path="/topics" component={TopicsPage} />
 											<Route path="/messages" component={MessagesPage} />
 											<Route path="/tokens" component={TokensPage} />
-											<Route path="/setup" component={SetupPage} />
+											<Route path="/connect" component={ConnectPage} />
 											<Route component={NotFound} />
 										</Switch>
 									)}

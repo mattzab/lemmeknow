@@ -18,7 +18,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useApi, useDocumentTitle } from "@/lib/hooks";
 import { ago, dateTime } from "@/lib/format";
 import { useServer } from "../App";
-import { AppInstructions } from "./SetupPage";
+import { CurlExamples, PhoneInstructions } from "./ConnectPage";
 
 type Draft = { id?: string; label: string; grants: Grant[]; expires: string };
 const NEW: Draft = { label: "", grants: [{ topic: "", read: true, write: false }], expires: "" };
@@ -75,6 +75,8 @@ export function TokensPage() {
 	const [edit, setEdit] = useState<Draft | null>(null);
 	const [created, setCreated] = useState<{ token: string; info: TokenInfo } | null>(null);
 	const [err, setErr] = useState<string>();
+	const firstGrant = created?.info.grants[0]?.topic;
+	const createdTopic = firstGrant && !firstGrant.includes("*") ? firstGrant : undefined;
 	const { run, busy } = useAction();
 	const confirm = useConfirm();
 
@@ -100,7 +102,7 @@ export function TokensPage() {
 	};
 
 	const revoke = async (t: TokenInfo) => {
-		if (!(await confirm({ title: `Revoke "${t.label}"?`, description: "Apps and scripts using this token stop working immediately.", confirmLabel: "Revoke", destructive: true }))) return;
+		if (!(await confirm({ title: `Revoke "${t.label}"?`, description: "Scripts using this token stop working immediately, and phones that subscribed with it stop getting notifications.", confirmLabel: "Revoke", destructive: true }))) return;
 		await run("del", () => admin.del(`/tokens/${t.id}`), "Token revoked");
 		void tokens.reload();
 	};
@@ -109,7 +111,7 @@ export function TokensPage() {
 		<>
 			<PageHeader
 				title="Tokens"
-				description="Every publisher and subscriber authenticates with a token. Grant it read (subscribe) and/or write (publish) on topics or * patterns."
+				description="Every publisher and subscriber authenticates with a token. Grant it read (inbox + notifications on a phone) and/or write (publish) on topics or * patterns. Use one token per phone or script."
 				actions={
 					<Button onClick={() => (setErr(undefined), setEdit(NEW))}>
 						<Plus /> New token
@@ -221,7 +223,8 @@ export function TokensPage() {
 							<DialogHeader title={`Token for ${created.info.label}`} description="Copy it now. Only a hash is stored, so it cannot be shown again." />
 							<DialogBody className="grid gap-4">
 								<CopyField value={created.token} />
-								<AppInstructions baseUrl={server?.baseUrl ?? location.origin} token={created.token} topic={created.info.grants[0]?.topic.includes("*") ? undefined : created.info.grants[0]?.topic} />
+								<PhoneInstructions baseUrl={server?.baseUrl ?? location.origin} topic={createdTopic} />
+								<CurlExamples baseUrl={server?.baseUrl ?? location.origin} token={created.token} topic={createdTopic} />
 							</DialogBody>
 							<DialogFooter>
 								<Button onClick={() => setCreated(null)}>Done</Button>

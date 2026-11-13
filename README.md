@@ -2,122 +2,131 @@
 
 # Lemmeknow
 
-A Cloudflare-native, [ntfy](https://ntfy.sh)-compatible push notification server. It runs entirely on Cloudflare Workers, Durable Objects, and D1. There is no VM or container to keep alive.
-
-Publish with `curl`, and receive notifications in the **official ntfy apps** for iOS and Android. Lemmeknow is not a port of the ntfy Go binary. It reimplements the HTTP API that the apps and `curl` already use.
+Push notifications to your phone from your own Cloudflare account. Lemmeknow is a small Worker, a D1 database and an installable web app (PWA). Scripts publish over a simple HTTP API, and the Worker delivers each message with standard **Web Push** to every phone that subscribed.
 
 ```sh
-curl -H "Authorization: Bearer tk_..." -H "Title: Backup" -d "Nightly backup finished" https://ntfy.example.com/backups
+curl -H "Authorization: Bearer lk_..." -d "Nightly backup finished" \
+  "https://lemmeknow.example.com/api/v1/topics/backups/messages?title=Backup"
 ```
 
-## How it differs from running ntfy yourself
+- **Nothing to install from an app store.** iPhone (iOS 16.4+) and Android open your deployment's URL and add it to the Home Screen.
+- **No central service.** Each deployment generates its own VAPID key pair on first use and keeps it in its own D1 database. There is no Firebase project, no relay and no account with anyone but Cloudflare. Pushes go straight from your Worker to the push service of the phone's browser (Apple for iPhone, Google for Chrome on Android), exactly as Web Push is designed.
+- **Private by default.** Every topic needs a token with an explicit read or write grant. Tokens are minted in a dashboard protected by Cloudflare Access.
+- **Cheap.** It fits the Workers free plan for personal use. Messages are packed into one D1 row per topic per day, and push subscriptions into one row per topic.
 
-| | ntfy (self-hosted) | Lemmeknow |
-| --- | --- | --- |
-| Runtime | One Go process on your server | A Worker plus a Durable Object (hibernatable WebSockets) plus D1 |
-| Default access | Open unless you configure auth | **Private**: every publisher and subscriber needs a token with explicit read/write grants. You can make individual topics anonymous. |
-| Users | Username/password accounts | Tokens only. The apps "log in" with any username and the token as the password. |
-| Admin UI | ntfy web app | A dashboard at `/admin` behind **Cloudflare Access** (JWT verified again in the Worker) |
-| iOS background delivery | `upstream-base-url` (ntfy.sh) | Same mechanism: an empty `poll_request` to ntfy.sh. Message content stays on your Worker. |
-| Android | Firebase or its own connection | Its own connection (JSON stream or WebSocket), entirely on Cloudflare |
+## How it works
 
-### What works
+```
+script ──POST /api/v1/topics/alerts/messages──▶ Worker ──▶ D1 (inbox)
+                                                  │
+                                    ctx.waitUntil │  RFC 8291 encrypted, VAPID-signed
+                                                  ▼
+                       web.push.apple.com / fcm.googleapis.com / Mozilla push
+                                                  │
+                                                  ▼
+                       phone ── service worker shows the notification
+```
 
-- **Publish:** `PUT`/`POST /<topic>` with every ntfy header and its query aliases: title, priority (1-5 or names), tags, click, icon, actions (simple and JSON formats), markdown, attach (external URL), delay/at/in (unix time or duration), and `cache=no`. Also `GET /<topic>/publish|send|trigger`.
-- **Publish as JSON:** `PUT`/`POST /` with `{"topic": "...", "message": "...", ...}`.
-- **Subscribe:** `/<topics>/json` (NDJSON), `/sse`, `/raw`, and `/ws`. Multiple topics work (`/a,b,c/json`). The stream sends `open`, `message`, and `keepalive` (every 45 s).
-- **Poll and replay:** `poll=1`, `since=all|latest|none|<unix>|<duration>|<message id>`, `scheduled=1`, and the `id`, `message`, `title`, `tags`, and `priority` filters.
-- **Auth, the same ways ntfy accepts it:** `Authorization: Bearer`, `Authorization: Basic` (any username, token as password), and `?auth=<base64url>`. `GET /<topics>/auth` lets the apps check credentials.
-- **Probe endpoints:** `/v1/health`, `/v1/config`, `/v1/stats`, `HEAD /`, plus UnifiedPush discovery (`?up=1`).
-- **iOS wakeups:** after a publish, the Worker sends `POST <upstream>/<sha256(base-url + "/" + topic)>` with `X-Poll-ID`. This matches ntfy's `forwardPollRequest`.
-- **Scheduled delivery and cleanup:** a once-a-minute cron delivers delayed messages and prunes expired ones. The cache keeps messages for 12 h by default.
-- **Dashboard:** topics, live subscriber counts, token minting with per-topic read/write grants (wildcards allowed), the recent message log, a send-test form, and copy-paste setup instructions for the apps.
+1. The phone opens the PWA, you add a topic and a token, and the browser asks to allow notifications.
+2. The PWA subscribes with `PushManager.subscribe()` using the deployment's VAPID public key and registers the subscription with `POST /api/v1/topics/<topic>/subscriptions`.
+3. A publish stores the message in the topic's inbox and, in the background, sends one encrypted push per subscribed device. Dead subscriptions (404/410 from the push service) are removed automatically.
+4. Tapping the notification opens its link, or the Lemmeknow inbox.
 
-### Not yet supported
+The Web Push implementation (`src/worker/webpush.ts`) uses only Web Crypto. It is tested against the RFC 8291 example vector.
 
-- File uploads (attachments stored in R2). External `attach` URLs work.
-- E-mail, phone calls, Matrix, and web push. These return ntfy's "not supported" errors.
-- User accounts, reservations, the ntfy web app, message templates, and message updates/deletes (`sequence_id`).
-- Natural-language delays such as "tomorrow, 10am". Unix timestamps and durations work.
-- Rate limiting beyond what Cloudflare provides.
+## API
 
-## Deploy
+All endpoints are under `/api/v1`, take and return JSON, and report errors as `{ "error": "...", "field": "..." }`. Authenticate with `Authorization: Bearer <token>`.
 
-You need a Cloudflare account with a zone for your hostname, Node 22+ (Node 24 is recommended), and a Workers Paid plan for Durable Objects with SQLite.
+| Method | Path | Grant | |
+| --- | --- | --- | --- |
+| `POST` | `/topics/{topic}/messages` | write | Publish. JSON `{ body, title?, url?, priority?, tags? }`, or a plain-text body with `title`, `url`, `priority`, `tags` as query parameters. Returns `201 { message, devices }`. |
+| `GET` | `/topics/{topic}/messages?limit=&since=` | read | The inbox, newest first. `since` is a Unix time in seconds. |
+| `POST` | `/topics/{topic}/subscriptions` | read | Register a device: `{ subscription: PushSubscription.toJSON() }`. |
+| `DELETE` | `/topics/{topic}/subscriptions` | none | Unregister: `{ endpoint }`. The endpoint itself is the secret. |
+| `GET` | `/push/key` | none | `{ public_key }`: the VAPID key for `PushManager.subscribe()`. |
+| `GET` | `/health` | none | `{ ok, version }` (also `/healthz`). |
 
-1. **Install:**
+Message fields: `body` (up to 4000 characters), `title` (200), `url` (http/https, opened on tap), `priority` 1–5 (default 3; 4 and 5 are sent with high urgency, 5 stays on screen, 1 is silent), `tags` (up to 10). Messages stay in the inbox for 7 days by default.
+
+Topic names are 1–64 letters, digits, `-` or `_`. A token grants read and/or write on topic names or `*` patterns (for example `alerts_*`).
+
+```sh
+# JSON
+curl -X POST https://lemmeknow.example.com/api/v1/topics/alerts/messages \
+  -H "Authorization: Bearer lk_..." -H "Content-Type: application/json" \
+  -d '{"title":"Disk","body":"/ is 90% full","priority":4,"url":"https://grafana.example.com"}'
+
+# Read the inbox
+curl -H "Authorization: Bearer lk_..." "https://lemmeknow.example.com/api/v1/topics/alerts/messages?limit=10"
+```
+
+## Deploy your own
+
+You need a Cloudflare account with a zone (domain) for the hostname, and Node 22+ (24 recommended). Everything below happens in your account.
+
+1. **Install**
 
    ```sh
-   git clone https://github.com/<you>/lemmeknow && cd lemmeknow && npm install
+   git clone https://github.com/mattzab/lemmeknow && cd lemmeknow && npm install
+   npx cf auth login   # or set CLOUDFLARE_API_TOKEN
    ```
 
-2. **Create a Cloudflare Access application** (Zero Trust → Access → Applications → Self-hosted):
-   - Destinations: `ntfy.example.com/admin` **and** `ntfy.example.com/api/admin`. Only these paths are protected. Never put Access in front of the whole hostname, because the phone apps can't get past a login page.
-   - Add a policy that allows you, for example by your e-mail address.
-   - Copy the application's **AUD tag**.
-3. **Configure:** copy `lemmeknow.config.example.json` to `lemmeknow.config.json` and fill it in. The real file is gitignored.
+2. **Protect the dashboard with Cloudflare Access** (Zero Trust → Access → Applications → Add → Self-hosted). Add two destinations on your hostname: path `admin` and path `api/admin`. Only those paths. Do **not** put Access in front of the whole hostname: the PWA, its service worker and manifest, and the API must stay public, or phones cannot install the app or receive pushes. Add a policy that allows you (for example your e-mail), then copy the application's **AUD tag**.
+
+3. **Configure.** Copy `lemmeknow.config.example.json` to `lemmeknow.config.json` (gitignored) and fill it in:
 
    | key | meaning |
    | --- | --- |
    | `accountId` | Your Cloudflare account ID |
-   | `host` | Hostname to serve, e.g. `ntfy.example.com` (a custom domain is attached on deploy) |
-   | `baseUrl` | The URL you enter in the apps, with no trailing slash. Defaults to `https://<host>`. It must match the apps exactly, because the iOS wakeup hash depends on it. |
+   | `host` | Hostname to serve, e.g. `lemmeknow.example.com`. The custom domain (and its DNS record) is attached on deploy. |
+   | `baseUrl` | Public URL, no trailing slash. Defaults to `https://<host>`. |
    | `accessTeamDomain` | `<team>.cloudflareaccess.com` |
    | `accessAud` | The AUD tag from step 2 |
-   | `upstreamBaseUrl` | `https://ntfy.sh` (default). Set it to `""` to disable iOS wakeups. |
-   | `cacheDurationSeconds` | How long messages stay pollable. Default: `43200` (12 h). |
+   | `retentionDays` | How long messages stay in the inbox. Default `7`. |
+   | `vapidSubject` | Optional contact for push services, `mailto:you@example.com` or an https URL. Defaults to `baseUrl`. |
 
-   You can use `LEMMEKNOW_*` environment variables instead (e.g. `LEMMEKNOW_HOST`); they override the file.
-4. **Optional secret.** Upstream wakeups come from Cloudflare's shared egress IPs, so ntfy.sh's anonymous per-IP limits can be hit. With an ntfy.sh account token, the requests count against your account instead:
+   `LEMMEKNOW_*` environment variables (e.g. `LEMMEKNOW_HOST`) override the file, which is handy in CI.
 
-   Add `UPSTREAM_ACCESS_TOKEN` as a secret on the `lemmeknow` Worker, either in the dashboard (Workers & Pages → lemmeknow → Settings → Variables and Secrets) or with `npx cf workers secrets`.
+4. **Deploy:** `npx cf deploy`. The first deploy creates the D1 database `lemmeknow-db`. The schema migrates itself, and the VAPID keys are generated, on first request. There are no secrets to set.
 
-5. **Deploy:** `npx cf deploy`. The first deploy provisions the D1 database (`lemmeknow-db`) and the Durable Object, and the schema migrates itself on the first request.
-6. Open `https://ntfy.example.com/admin`, create a topic, and mint a token.
+5. Open `https://<host>/admin`, create a topic, mint a token (it is shown once), and use **Send** to try it.
 
-## Point the official apps at it
+## Install on a phone
 
-The dashboard's **App setup** page and the "token created" dialog show these steps with your real URL filled in.
+**iPhone (iOS 16.4 or later)**
 
-**iOS (ntfy for iOS)**
-1. Settings → Users → Add user. Service URL: `https://ntfy.example.com`. Username: anything. Password: your token.
-2. Tap + to add a topic → turn on "Use another server" → enter `https://ntfy.example.com`.
+1. Open `https://<host>/` in **Safari**.
+2. Tap **Share** → **Add to Home Screen** → **Add**.
+3. Open **Lemmeknow** from the Home Screen icon. Web Push only works there, not in a Safari tab.
+4. Enter the topic and token, tap **Subscribe**, then **Allow**.
+5. Tap the send icon next to the topic (with a write token) or use **Send** in the dashboard. The notification should arrive even with the app closed.
 
-Background notifications arrive through the ntfy.sh wakeup. The app then fetches the message from your server by ID.
+The Home Screen app has its own storage, separate from Safari, so enter the token inside the installed app.
 
-**Android (Google Play or F-Droid)**
-1. Settings → Manage users → Add user: your server URL, any username, and the token as the password.
-2. Tap + to add a topic → "Use another server" → your URL. Turn on instant delivery.
-3. Recommended: Settings → Connection protocol → **WebSockets**. WebSocket subscribers hibernate in the Durable Object, which is the cheapest way to keep a phone connected.
+**Android (Chrome)**
 
-**Scripts**
+1. Open `https://<host>/` in Chrome. Optionally ⋮ → **Add to Home screen** → **Install**.
+2. Enter the topic and token, tap **Subscribe**, then **Allow**.
 
-```sh
-curl -u ":tk_..." -d "Disk 91% full" -H "Priority: high" -H "Tags: warning" https://ntfy.example.com/alerts
-curl -s -H "Authorization: Bearer tk_..." "https://ntfy.example.com/alerts/json?poll=1&since=1h"
-```
+Desktop Chrome, Edge, Firefox and Safari work too.
 
 ## Develop
 
 ```sh
-npx cf dev        # http://localhost:5173. On localhost the dashboard skips Access.
-npm test          # Vitest: publish parsing, auth, message JSON, poll/since/id, iOS poll_request
+npm run dev        # cf dev: Worker + Vite on localhost (Access is bypassed on localhost only)
+npm test           # Vitest: Web Push crypto, API, store
 npm run typecheck
 ```
 
-To create a token locally:
+Layout: `src/worker` (Hono API, Web Push, D1 store), `src/pwa` (the public app), `src/client` (the dashboard), `public/sw.js` (service worker), `cloudflare.config.ts` (deployment). Design notes are in [docs/DECISIONS.md](docs/DECISIONS.md).
 
-```sh
-curl -X POST localhost:5173/api/admin/tokens -H 'content-type: application/json' \
-  -d '{"label":"dev","grants":[{"topic":"*","read":true,"write":true}]}'
-```
+## Limits
 
-Design notes, including the Access-versus-apps split and the iOS upstream tradeoff, are in [`docs/DECISIONS.md`](docs/DECISIONS.md).
-
-## Credits
-
-[ntfy](https://github.com/binwiederhier/ntfy) is by Philipp C. Heckel. Lemmeknow reimplements its public HTTP API so the official ntfy apps can use a Cloudflare-hosted server. It is not affiliated with the ntfy project.
+- A topic holds up to 1000 devices. On the Workers free plan, one publish can reach about 45 devices (50 subrequests per invocation); the paid plan raises that far beyond the per-topic cap.
+- Push payloads are capped at 4 KB by push services, so very long bodies are shortened in the notification. The full text stays in the inbox.
+- No attachments, scheduled delivery, or e-mail/SMS.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

@@ -1,9 +1,9 @@
 {
 	"accountId": "your-cloudflare-account-id",
-	"host": "ntfy.example.com",
-	"baseUrl": "https://ntfy.example.com",
+	"host": "lemmeknow.example.com",
+	"baseUrl": "https://lemmeknow.example.com",
 	"accessTeamDomain": "your-team.cloudflareaccess.com",
 	"accessAud": "aud-tag-of-the-dashboard-access-application",
-	"upstreamBaseUrl": "https://ntfy.sh",
-	"cacheDurationSeconds": "43200"
+	"retentionDays": "7",
+	"vapidSubject": ""
 }
