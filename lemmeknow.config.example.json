@@ -5,5 +5,6 @@
 	"accessTeamDomain": "your-team.cloudflareaccess.com",
 	"accessAud": "aud-tag-of-the-dashboard-access-application",
 	"retentionDays": "7",
-	"vapidSubject": ""
+	"vapidSubject": "",
+	"adminEmails": "you@example.com"
 }

@@ -1,5 +1,5 @@
 import type { Grant, TokenInfo, TopicInfo } from "@shared/types";
-import { KeyRound, Pencil, Plus, Trash2, X } from "lucide-react";
+import { KeyRound, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { admin } from "@/api";
 import { Badge } from "@/components/ui/badge";
@@ -9,19 +9,21 @@ import { useConfirm } from "@/components/ui/confirm";
 import { CopyField } from "@/components/ui/copy";
 import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader } from "@/components/ui/dialog";
 import { EmptyState, ErrorState } from "@/components/ui/empty-state";
-import { Field, Input, Select } from "@/components/ui/input";
+import { Field, Input } from "@/components/ui/input";
 import { PageHeader, Table, Td, Th, Tr } from "@/components/ui/page";
 import { TableSkeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/ui/switch";
 import { useAction } from "@/components/ui/toast";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useApi, useDocumentTitle } from "@/lib/hooks";
-import { ago, dateTime } from "@/lib/format";
+import { ago } from "@/lib/format";
 import { useServer } from "../App";
 import { CurlExamples, PhoneInstructions } from "./ConnectPage";
 
-type Draft = { id?: string; label: string; grants: Grant[]; expires: string };
-const NEW: Draft = { label: "", grants: [{ topic: "", read: true, write: false }], expires: "" };
+type Draft = { id?: string; label: string; grants: Grant[]; personal?: boolean };
+const NEW: Draft = { label: "", grants: [{ topic: "", read: true, write: false }] };
+
+export { GrantsEditor };
 
 export function grantSummary(g: Grant) {
 	return g.read && g.write ? "read-write" : g.read ? "read" : "write";
@@ -87,8 +89,8 @@ export function TokensPage() {
 		const grants = edit.grants.filter((g) => g.topic.trim());
 		const r = await run("save", async () => {
 			try {
-				if (edit.id) return await admin.patch(`/tokens/${edit.id}`, { label: edit.label, grants });
-				return await admin.post<{ token: string; info: TokenInfo }>("/tokens", { label: edit.label, grants, expires_in_days: edit.expires ? Number(edit.expires) : null });
+				if (edit.id) return await admin.patch(`/tokens/${edit.id}`, edit.personal ? { label: edit.label } : { label: edit.label, grants });
+				return await admin.post<{ token: string; info: TokenInfo }>("/tokens", { label: edit.label, grants });
 			} catch (e) {
 				setErr((e as Error).message);
 				throw e;
@@ -107,11 +109,26 @@ export function TokensPage() {
 		void tokens.reload();
 	};
 
+	const replace = async (t: TokenInfo) => {
+		const legacy = !t.token;
+		if (
+			!(await confirm({
+				title: `${legacy ? "Replace" : "Make a new value for"} "${t.label}"?`,
+				description: `${legacy ? "This token was made before tokens could be shown again. " : ""}You get a new token with the same name and grants; the old value stops working now. Phones that subscribed with it keep getting notifications, but scripts need the new value.`,
+				confirmLabel: legacy ? "Replace" : "New value",
+			}))
+		)
+			return;
+		const r = await run("replace", () => admin.post<{ token: string; info: TokenInfo }>(`/tokens/${t.id}/replace`));
+		if (r) setCreated(r);
+		void tokens.reload();
+	};
+
 	return (
 		<>
 			<PageHeader
 				title="Tokens"
-				description="Every publisher and subscriber authenticates with a token. Grant it read (inbox + notifications on a phone) and/or write (publish) on topics or * patterns. Use one token per phone or script."
+				description="Every publisher and subscriber authenticates with a token. Grant it read (inbox + notifications on a phone) and/or write (publish) on topics or * patterns. Tokens never expire and can be copied here any time; revoke one to cut it off. Personal tokens belong to a user and follow their grants."
 				actions={
 					<Button onClick={() => (setErr(undefined), setEdit(NEW))}>
 						<Plus /> New token
@@ -135,8 +152,8 @@ export function TokensPage() {
 									<Th>Name</Th>
 									<Th>Token</Th>
 									<Th>Grants</Th>
+									<Th>Owner</Th>
 									<Th>Last used</Th>
-									<Th>Expires</Th>
 									<Th className="text-right">Actions</Th>
 								</tr>
 							</thead>
@@ -144,7 +161,18 @@ export function TokensPage() {
 								{tokens.data.map((t) => (
 									<Tr key={t.id}>
 										<Td className="font-medium">{t.label}</Td>
-										<Td className="font-mono text-xs text-muted-foreground">{t.prefix}…</Td>
+										<Td className="min-w-0 max-w-[16rem]">
+											{t.token ? (
+												<CopyField value={t.token} secret />
+											) : (
+												<div className="flex items-center gap-2">
+													<span className="font-mono text-xs text-muted-foreground">{t.prefix}…</span>
+													<Tooltip content="Made before tokens were stored. Replace it to get a copyable value.">
+														<Badge className="border-amber-500/40 text-amber-600 dark:text-amber-400">not viewable</Badge>
+													</Tooltip>
+												</div>
+											)}
+										</Td>
 										<Td>
 											<div className="flex flex-wrap gap-1">
 												{t.grants.length === 0 && <span className="text-xs text-muted-foreground">none</span>}
@@ -155,12 +183,20 @@ export function TokensPage() {
 												))}
 											</div>
 										</Td>
+										<Td className="text-xs text-muted-foreground">
+											{t.user_email ?? "—"}
+											{t.personal && <Badge className="ml-1">personal</Badge>}
+										</Td>
 										<Td className="text-muted-foreground">{ago(t.last_used_at)}</Td>
-										<Td className="text-muted-foreground">{t.expires_at ? dateTime(t.expires_at) : "never"}</Td>
 										<Td className="text-right">
 											<div className="inline-flex gap-1">
-												<Tooltip content="Edit name and grants">
-													<Button variant="ghost" size="icon-sm" onClick={() => (setErr(undefined), setEdit({ id: t.id, label: t.label, grants: t.grants, expires: "" }))}>
+												<Tooltip content={t.token ? "New value (same name and grants)" : "Replace with a copyable token"}>
+													<Button variant="ghost" size="icon-sm" loading={busy === "replace"} onClick={() => void replace(t)}>
+														<RefreshCw />
+													</Button>
+												</Tooltip>
+												<Tooltip content={t.personal ? "Edit name (grants follow the user)" : "Edit name and grants"}>
+													<Button variant="ghost" size="icon-sm" onClick={() => (setErr(undefined), setEdit({ id: t.id, label: t.label, grants: t.grants, personal: t.personal }))}>
 														<Pencil />
 													</Button>
 												</Tooltip>
@@ -188,18 +224,11 @@ export function TokensPage() {
 								<Field label="Name" htmlFor="tok-label" hint="Who or what uses it, e.g. Matt's iPhone or backup script.">
 									<Input id="tok-label" value={edit.label} onChange={(e) => setEdit({ ...edit, label: e.target.value })} required />
 								</Field>
-								<Field label="Grants" error={err}>
-									<GrantsEditor grants={edit.grants} onChange={(grants) => setEdit({ ...edit, grants })} topics={topics.data?.map((t) => t.name) ?? []} />
-								</Field>
-								{!edit.id && (
-									<Field label="Expires" htmlFor="tok-exp">
-										<Select id="tok-exp" value={edit.expires} onChange={(e) => setEdit({ ...edit, expires: e.target.value })}>
-											<option value="">Never</option>
-											<option value="7">In 7 days</option>
-											<option value="30">In 30 days</option>
-											<option value="90">In 90 days</option>
-											<option value="365">In 1 year</option>
-										</Select>
+								{edit.personal ? (
+									<p className="text-sm text-muted-foreground">This is a user's personal token: change what it can do on the Users page.</p>
+								) : (
+									<Field label="Grants" error={err}>
+										<GrantsEditor grants={edit.grants} onChange={(grants) => setEdit({ ...edit, grants })} topics={topics.data?.map((t) => t.name) ?? []} />
 									</Field>
 								)}
 							</DialogBody>
@@ -220,7 +249,7 @@ export function TokensPage() {
 				<DialogContent wide>
 					{created && (
 						<>
-							<DialogHeader title={`Token for ${created.info.label}`} description="Copy it now. Only a hash is stored, so it cannot be shown again." />
+							<DialogHeader title={`Token for ${created.info.label}`} description="You can copy it again from this page any time. It works until you revoke it." />
 							<DialogBody className="grid gap-4">
 								<CopyField value={created.token} />
 								<PhoneInstructions baseUrl={server?.baseUrl ?? location.origin} topic={createdTopic} />

@@ -1,6 +1,6 @@
 {
 	"name": "lemmeknow",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"private": true,
 	"description": "Self-hosted push notifications on Cloudflare: a Worker, D1, and an installable web app with Web Push.",
 	"license": "MIT",

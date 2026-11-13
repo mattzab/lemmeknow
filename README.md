@@ -12,6 +12,7 @@ curl -H "Authorization: Bearer lk_..." -d "Nightly backup finished" \
 - **Nothing to install from an app store.** iPhone (iOS 16.4+) and Android open your deployment's URL and add it to the Home Screen.
 - **No central service.** Each deployment generates its own VAPID key pair on first use and keeps it in its own D1 database. There is no Firebase project, no relay and no account with anyone but Cloudflare. Pushes go straight from your Worker to the push service of the phone's browser (Apple for iPhone, Google for Chrome on Android), exactly as Web Push is designed.
 - **Private by default.** Every topic needs a token with an explicit read or write grant. Tokens are minted in a dashboard protected by Cloudflare Access.
+- **Log in with your e-mail.** Invite people by e-mail from the dashboard. They tap **Log in** in the app, get a one-time code from Cloudflare Access, and find their topics and their own permanent token waiting.
 - **Cheap.** It fits the Workers free plan for personal use. Messages are packed into one D1 row per topic per day, and push subscriptions into one row per topic.
 
 ## How it works
@@ -44,6 +45,8 @@ All endpoints are under `/api/v1`, take and return JSON, and report errors as `{
 | `GET` | `/topics/{topic}/messages?limit=&since=` | read | The inbox, newest first. `since` is a Unix time in seconds. |
 | `POST` | `/topics/{topic}/subscriptions` | read | Register a device: `{ subscription: PushSubscription.toJSON() }`. |
 | `DELETE` | `/topics/{topic}/subscriptions` | none | Unregister: `{ endpoint }`. The endpoint itself is the secret. |
+| `GET` | `/me` | personal token | `{ email, role, token, grants, topics }` for the token's owner. |
+| `POST` | `/pair` | none | `{ code }` from a signed-in browser → the same as `/me`. One-time, 10 minutes. |
 | `GET` | `/push/key` | none | `{ public_key }`: the VAPID key for `PushManager.subscribe()`. |
 | `GET` | `/health` | none | `{ ok, version }` (also `/healthz`). |
 
@@ -72,7 +75,7 @@ You need a Cloudflare account with a zone (domain) for the hostname, and Node 22
    npx cf auth login   # or set CLOUDFLARE_API_TOKEN
    ```
 
-2. **Protect the dashboard with Cloudflare Access** (Zero Trust → Access → Applications → Add → Self-hosted). Add two destinations on your hostname: path `admin` and path `api/admin`. Only those paths. Do **not** put Access in front of the whole hostname: the PWA, its service worker and manifest, and the API must stay public, or phones cannot install the app or receive pushes. Add a policy that allows you (for example your e-mail), then copy the application's **AUD tag**.
+2. **Protect the dashboard and the login with Cloudflare Access** (Zero Trust → Access → Applications → Add → Self-hosted). Add these destinations on your hostname, and only these: paths `admin`, `api/admin`, `api/me` and `login` (Access covers sub-paths of each). Do **not** put Access in front of the whole hostname: the PWA, its service worker and manifest, `/api/v1` and `/access/*` must stay public, or phones cannot install the app or receive pushes. Turn on the **One-time PIN** login method, add a policy that includes your own e-mail, then copy the application's **AUD tag**.
 
 3. **Configure.** Copy `lemmeknow.config.example.json` to `lemmeknow.config.json` (gitignored) and fill it in:
 
@@ -83,14 +86,30 @@ You need a Cloudflare account with a zone (domain) for the hostname, and Node 22
    | `baseUrl` | Public URL, no trailing slash. Defaults to `https://<host>`. |
    | `accessTeamDomain` | `<team>.cloudflareaccess.com` |
    | `accessAud` | The AUD tag from step 2 |
+   | `adminEmails` | Your e-mail (comma-separate several). These owners are always admins and cannot be removed from the dashboard. If empty, anyone your Access policy lets in is an admin until the first user is invited. |
    | `retentionDays` | How long messages stay in the inbox. Default `7`. |
    | `vapidSubject` | Optional contact for push services, `mailto:you@example.com` or an https URL. Defaults to `baseUrl`. |
 
-   `LEMMEKNOW_*` environment variables (e.g. `LEMMEKNOW_HOST`) override the file, which is handy in CI.
+   `LEMMEKNOW_*` environment variables (e.g. `LEMMEKNOW_HOST`, `LEMMEKNOW_ADMIN_EMAILS`) override the file, which is handy in CI.
 
-4. **Deploy:** `npx cf deploy`. The first deploy creates the D1 database `lemmeknow-db`. The schema migrates itself, and the VAPID keys are generated, on first request. There are no secrets to set.
+4. **Deploy:** `npx cf deploy`. The first deploy creates the D1 database `lemmeknow-db`. The schema migrates itself, and the VAPID and Access-evaluation keys are generated, on first request. There are no secrets to set.
 
-5. Open `https://<host>/admin`, create a topic, mint a token (it is shown once), and use **Send** to try it.
+5. **Let invited people through Access.** Edit the policy from step 2 and add a second Include rule of type **External Evaluation**:
+
+   | Evaluate URL | Keys URL |
+   | --- | --- |
+   | `https://<host>/access/evaluate` | `https://<host>/access/keys` |
+
+   Access then asks your Worker, after each e-mail login, whether that address is on the Users list (owners included), and the Worker answers with a signed yes or no. Keep your own e-mail rule in the policy too, so you can always get in. The dashboard's **Users** page shows these URLs.
+
+6. Open `https://<host>/admin`, create a topic, mint a token, and use **Send** to try it. Add people on the **Users** page.
+
+## Users, login and tokens
+
+- **Log in.** The app at `https://<host>/` has a small **Log in** button. It goes through Cloudflare Access (an e-mailed one-time code) and lands back in the app, signed in. You then see your topics with one-tap **Add**, and your personal token.
+- **Tokens never expire and stay copyable.** Every token, including each person's personal token, is stored in full in D1 so it can be copied again from the app (your own) or the dashboard (all of them). That means **anyone who can open the dashboard can see every token**; only make people admins whom you trust with that. Revoke a token to cut it off; **New value** issues a fresh one and keeps phones that subscribed with the old one. Tokens made before 0.3 were stored only as a hash: they show as *not viewable*, and **Replace** gives them a copyable value with the same name and grants.
+- **Users.** On the dashboard's **Users** page, add someone by e-mail as a **member** (the app plus their own token, limited to the topics you grant) or an **admin** (everything). Removing someone ends their login, revokes their tokens and unsubscribes their phones. Access sessions can outlive that, but the Worker checks the Users list on every request.
+- **iPhone Home Screen app.** The installed app has its own cookies, separate from Safari. Logging in from inside it normally works. If the e-mail login ends up in Safari instead, open the app's page in Safari, tap your name → **Code for Home Screen app**, and type the code into **Log in** → *Enter its code* inside the installed app.
 
 ## Install on a phone
 
@@ -99,23 +118,24 @@ You need a Cloudflare account with a zone (domain) for the hostname, and Node 22
 1. Open `https://<host>/` in **Safari**.
 2. Tap **Share** → **Add to Home Screen** → **Add**.
 3. Open **Lemmeknow** from the Home Screen icon. Web Push only works there, not in a Safari tab.
-4. Enter the topic and token, tap **Subscribe**, then **Allow**.
+4. Tap **Log in** and sign in with your e-mail, then **Add** a topic and tap **Allow**. (Or type a topic and a token under **Add a topic**.)
 5. Tap the send icon next to the topic (with a write token) or use **Send** in the dashboard. The notification should arrive even with the app closed.
 
-The Home Screen app has its own storage, separate from Safari, so enter the token inside the installed app.
+The Home Screen app has its own storage, separate from Safari, so log in (or enter the token) inside the installed app.
 
 **Android (Chrome)**
 
 1. Open `https://<host>/` in Chrome. Optionally ⋮ → **Add to Home screen** → **Install**.
-2. Enter the topic and token, tap **Subscribe**, then **Allow**.
+2. Tap **Log in**, then **Add** a topic (or enter a topic and token), then **Allow**.
 
 Desktop Chrome, Edge, Firefox and Safari work too.
 
 ## Develop
 
 ```sh
-npm run dev        # cf dev: Worker + Vite on localhost (Access is bypassed on localhost only)
-npm test           # Vitest: Web Push crypto, API, store
+npm run dev        # cf dev: Worker + Vite on localhost (Access is bypassed on localhost only;
+                   # the x-dev-access-email header picks who you are there)
+npm test           # Vitest: Web Push crypto, API, store, users and login
 npm run typecheck
 ```
 

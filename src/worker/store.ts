@@ -1,4 +1,5 @@
-import type { Grant, Message, TokenInfo, TopicInfo } from "@shared/types";
+import type { Grant, Message, Role, TokenInfo, TopicInfo } from "@shared/types";
+import { sha256Hex } from "./util";
 import type { VapidKeys } from "./webpush";
 import { generateVapidKeys } from "./webpush";
 
@@ -72,6 +73,19 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE TABLE IF NOT EXISTS push_subs (
   topic TEXT PRIMARY KEY, subs TEXT NOT NULL DEFAULT '[]', version INTEGER NOT NULL DEFAULT 1) WITHOUT ROWID
 `,
+	// 5: 0.3 adds people. Tokens keep their full value (copyable from the dashboard and the
+	// signed-in app) and can belong to a user; `users` lists invited emails; `pair_codes` hands a
+	// Safari login over to the Home Screen app. Tokens from before 0.3 only have a hash.
+	`
+ALTER TABLE tokens ADD COLUMN token TEXT;
+ALTER TABLE tokens ADD COLUMN user_email TEXT;
+ALTER TABLE tokens ADD COLUMN personal INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS users (
+  email TEXT PRIMARY KEY, role TEXT NOT NULL DEFAULT 'member', grants TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL, added_by TEXT) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS pair_codes (
+  code_hash TEXT PRIMARY KEY, email TEXT NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID
+`,
 ];
 
 
@@ -112,6 +126,7 @@ export function resetSchemaFlag() {
 	migratedIsolate = false;
 	partHint.clear();
 	vapidCache = null;
+	evalKeyCache = null;
 }
 
 // ---------- settings: the deployment's VAPID key pair ----------
@@ -414,13 +429,20 @@ export interface TokenRow {
 	created_at: number;
 	last_used_at: number | null;
 	expires_at: number | null;
+	/** Full token value (null for pre-0.3 tokens, which only kept a hash). */
+	token: string | null;
+	user_email: string | null;
+	personal: number;
 }
 
 export const tokenInfo = (r: TokenRow): TokenInfo => ({
 	id: r.id,
 	label: r.label,
 	prefix: r.prefix,
+	token: r.token ?? null,
 	grants: JSON.parse(r.grants) as Grant[],
+	user_email: r.user_email ?? null,
+	personal: !!r.personal,
 	created_at: r.created_at,
 	last_used_at: r.last_used_at,
 	expires_at: r.expires_at,
@@ -431,14 +453,20 @@ export async function listTokens(db: D1Database): Promise<TokenInfo[]> {
 	return results.map(tokenInfo);
 }
 
+export async function getToken(db: D1Database, id: string): Promise<TokenRow | null> {
+	return db.prepare("SELECT * FROM tokens WHERE id = ?").bind(id).first<TokenRow>();
+}
+
 export async function findTokenByHash(db: D1Database, hash: string): Promise<TokenRow | null> {
 	return db.prepare("SELECT * FROM tokens WHERE token_hash = ?").bind(hash).first<TokenRow>();
 }
 
-export async function insertToken(db: D1Database, row: TokenRow): Promise<void> {
+export async function insertToken(db: D1Database, row: Omit<TokenRow, "token" | "user_email" | "personal"> & Partial<Pick<TokenRow, "token" | "user_email" | "personal">>): Promise<void> {
 	await db
-		.prepare("INSERT INTO tokens (id, label, token_hash, prefix, grants, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-		.bind(row.id, row.label, row.token_hash, row.prefix, row.grants, row.created_at, row.last_used_at, row.expires_at)
+		.prepare(
+			"INSERT INTO tokens (id, label, token_hash, prefix, grants, created_at, last_used_at, expires_at, token, user_email, personal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		)
+		.bind(row.id, row.label, row.token_hash, row.prefix, row.grants, row.created_at, row.last_used_at, row.expires_at, row.token ?? null, row.user_email ?? null, row.personal ?? 0)
 		.run();
 }
 
@@ -460,4 +488,113 @@ export async function deleteToken(db: D1Database, id: string): Promise<boolean> 
 
 export async function touchToken(db: D1Database, id: string, now: number): Promise<void> {
 	await db.prepare("UPDATE tokens SET last_used_at = ? WHERE id = ?").bind(now, id).run();
+}
+
+export async function personalToken(db: D1Database, email: string): Promise<TokenRow | null> {
+	return db.prepare("SELECT * FROM tokens WHERE user_email = ? AND personal = 1 ORDER BY created_at DESC LIMIT 1").bind(email).first<TokenRow>();
+}
+
+export async function tokensOfUser(db: D1Database, email: string): Promise<TokenRow[]> {
+	return (await db.prepare("SELECT * FROM tokens WHERE user_email = ?").bind(email).all<TokenRow>()).results;
+}
+
+/** Point every push subscription made with token `from` at token `to` (token replacement keeps devices). */
+export async function moveSubscriptions(db: D1Database, from: string, to: string): Promise<number> {
+	const { results } = await db.prepare("SELECT topic, subs FROM push_subs").all<{ topic: string; subs: string }>();
+	let moved = 0;
+	for (const r of results) {
+		if (!(JSON.parse(r.subs) as StoredSub[]).some((s) => s.token_id === from)) continue;
+		await mutateSubs(db, r.topic, (subs) => {
+			let n = 0;
+			const next = subs.map((s) => (s.token_id === from ? (n++, { ...s, token_id: to }) : s));
+			moved += n;
+			return n ? next : null;
+		});
+	}
+	return moved;
+}
+
+// ---------- users ----------
+
+export interface UserRow {
+	email: string;
+	role: Role;
+	grants: string;
+	created_at: number;
+	added_by: string | null;
+}
+
+export async function listUserRows(db: D1Database): Promise<UserRow[]> {
+	return (await db.prepare("SELECT * FROM users ORDER BY created_at").all<UserRow>()).results;
+}
+
+export async function getUser(db: D1Database, email: string): Promise<UserRow | null> {
+	return db.prepare("SELECT * FROM users WHERE email = ?").bind(email).first<UserRow>();
+}
+
+export async function upsertUser(db: D1Database, u: { email: string; role: Role; grants: Grant[]; added_by: string | null }, now: number): Promise<void> {
+	await db
+		.prepare(
+			"INSERT INTO users (email, role, grants, created_at, added_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET role = excluded.role, grants = excluded.grants",
+		)
+		.bind(u.email, u.role, JSON.stringify(u.grants), now, u.added_by)
+		.run();
+}
+
+export async function deleteUserRow(db: D1Database, email: string): Promise<boolean> {
+	const [r] = await db.batch([db.prepare("DELETE FROM users WHERE email = ?").bind(email), db.prepare("DELETE FROM pair_codes WHERE email = ?").bind(email)]);
+	return (r.meta?.changes ?? 0) > 0;
+}
+
+export async function tokenCounts(db: D1Database): Promise<Record<string, number>> {
+	const { results } = await db.prepare("SELECT user_email, COUNT(*) AS n FROM tokens WHERE user_email IS NOT NULL GROUP BY user_email").all<{ user_email: string; n: number }>();
+	return Object.fromEntries(results.map((r) => [r.user_email, r.n]));
+}
+
+// ---------- pairing codes (Safari login → Home Screen app) ----------
+
+export async function insertPairCode(db: D1Database, codeHash: string, email: string, expiresAt: number): Promise<void> {
+	await db.prepare("INSERT INTO pair_codes (code_hash, email, expires_at) VALUES (?, ?, ?)").bind(codeHash, email, expiresAt).run();
+}
+
+/** One-time: deletes the code and returns its email if it was still valid. */
+export async function consumePairCode(db: D1Database, codeHash: string, now: number): Promise<string | null> {
+	const { results } = await db.prepare("DELETE FROM pair_codes WHERE code_hash = ? RETURNING email, expires_at").bind(codeHash).all<{ email: string; expires_at: number }>();
+	const r = results[0];
+	return r && r.expires_at > now ? r.email : null;
+}
+
+export async function prunePairCodes(db: D1Database, now: number): Promise<void> {
+	await db.prepare("DELETE FROM pair_codes WHERE expires_at <= ?").bind(now).run();
+}
+
+// ---------- the Access External Evaluation signing key ----------
+
+export interface EvalKey {
+	kid: string;
+	publicJwk: JsonWebKey;
+	privateJwk: JsonWebKey;
+}
+
+let evalKeyCache: EvalKey | null = null;
+
+/** RSA key that signs External Evaluation answers to Cloudflare Access. Generated once, kept in D1. */
+export async function getEvalKey(db: D1Database): Promise<EvalKey> {
+	if (evalKeyCache) return evalKeyCache;
+	const read = () => db.prepare("SELECT value FROM settings WHERE key = 'access_eval_key'").first<{ value: string }>();
+	let row = await read();
+	if (!row) {
+		const kp = (await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, [
+			"sign",
+			"verify",
+		])) as CryptoKeyPair;
+		const publicJwk = (await crypto.subtle.exportKey("jwk", kp.publicKey)) as JsonWebKey;
+		const privateJwk = (await crypto.subtle.exportKey("jwk", kp.privateKey)) as JsonWebKey;
+		const kid = (await sha256Hex(JSON.stringify({ e: publicJwk.e, n: publicJwk.n }))).slice(0, 32);
+		await db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('access_eval_key', ?)").bind(JSON.stringify({ kid, publicJwk, privateJwk })).run();
+		row = await read();
+	}
+	if (!row) throw new Error("could not store the Access evaluation key");
+	evalKeyCache = JSON.parse(row.value) as EvalKey;
+	return evalKeyCache;
 }

@@ -8,8 +8,10 @@ export interface Env {
 	ACCESS_AUD: string;
 	/** How long messages stay in the inbox, in seconds. */
 	RETENTION_SECONDS: string;
+	/** Owner emails (comma separated) who are always admins. From adminEmails in lemmeknow.config.json. */
+	ADMIN_EMAILS: string;
 	/** Optional VAPID contact (`mailto:` or `https:`). Defaults to BASE_URL. */
 	VAPID_SUBJECT: string;
 }
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";

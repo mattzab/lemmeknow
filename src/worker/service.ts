@@ -1,6 +1,6 @@
 import type { Message, Priority, PushPayload } from "@shared/types";
 import type { Env } from "./env";
-import { getSubscriptions, getVapidKeys, insertMessage, pruneExpired, removeSubscriptions, type StoredSub } from "./store";
+import { getSubscriptions, getVapidKeys, insertMessage, pruneExpired, prunePairCodes, removeSubscriptions, type StoredSub } from "./store";
 import { isValidTopic, normalizeBaseUrl, nowSec, randomString, utf8 } from "./util";
 import { type PushResult, sendPush, type Urgency } from "./webpush";
 
@@ -136,5 +136,7 @@ export async function publish(env: Env, waitUntil: WaitUntil, m: Message, subjec
 
 /** Cron: drop expired inbox rows. */
 export async function runScheduled(env: Env): Promise<{ pruned: number }> {
-	return { pruned: await pruneExpired(env.DB, nowSec()) };
+	const now = nowSec();
+	await prunePairCodes(env.DB, now);
+	return { pruned: await pruneExpired(env.DB, now) };
 }

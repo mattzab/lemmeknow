@@ -17,20 +17,26 @@ Node `web-push` libraries rely on `crypto` APIs that don't exist in Workers. `sr
 
 The key pair is generated on first use and stored in `settings` as a single row (`INSERT OR IGNORE`, then read back, so concurrent first requests agree). That removes a manual "generate keys and set two secrets" step for self-hosters. The private key never leaves the database. It is never rotated automatically, because a new key invalidates every subscription.
 
-## Cloudflare Access protects only the dashboard
+## Cloudflare Access protects only the dashboard and the login
 
 Access in front of the whole hostname would break the PWA: browsers fetch the manifest and register the service worker without Access cookies, and scripts can't complete an Access login. So:
 
-- The Access application covers only `/admin` and `/api/admin`.
+- The Access application covers only `/admin`, `/api/admin`, `/api/me` and `/login`.
 - The Worker verifies `Cf-Access-Jwt-Assertion` again on those paths (RS256 signature against the team JWKS, audience, issuer, expiry), so a misconfigured policy fails closed. Only `localhost` (for `cf dev`) is exempt.
 - `/api/v1` uses tokens. Topics are private unless you make one public in the dashboard.
 - The PWA itself (`/`, `/sw.js`, the manifest, icons, `/assets/*`) is static content served straight from Workers Static Assets without running the Worker. It contains no data.
 
-## Tokens instead of users
+## Users on top of tokens, with Access doing the login
 
-Lemmeknow keeps only **tokens with grants**, for example `alerts_*: read+write` or `family: read`. Use one per phone or script. Only a SHA-256 of each token is stored, and the plaintext is shown once. Each push subscription remembers the token it was created with, and revoking that token removes those devices, so a lost phone stops receiving notifications.
+Authorization is still **tokens with grants** (for example `alerts_*: read+write`). People are a layer on top: a `users` row (e-mail, role, grants) plus one **personal token** per person whose grants follow theirs. Members get the app and their personal token; admins get the dashboard. Owners come from `adminEmails` in the gitignored config, so no e-mail address is ever committed.
 
-The PWA stores topic + token in the device's `localStorage`. On iPhone the Home Screen app's storage is separate from Safari's, which is why setup happens inside the installed app.
+Login is Cloudflare Access (e-mail one-time PIN) on `/login` and `/api/me`, the same application and AUD as the dashboard. To let invited people through without an API token or a policy edit per invite, the Access policy has an **External Evaluation** rule pointing at `/access/evaluate`: Access posts a JWT signed by the team key (verified against the team JWKS), and the Worker answers with a JWT signed by its own RSA key (published at `/access/keys`, generated on first use and kept in D1 like the VAPID key) saying whether the e-mail is an owner or an invited user, echoing the nonce. The owner's own e-mail rule stays in the policy, so a broken Worker cannot lock the owner out. Because Access sessions can last weeks, the Worker also re-checks the Users list on every `/api/me`, `/api/admin` and `/admin` request: removing someone takes effect immediately.
+
+**Tokens are stored in full.** The first version stored only a SHA-256 and showed the token once. People wanted to copy a token again from their phone, so 0.3 stores the token itself (lookups still go through the hash index) and drops expiry. The tradeoff: anyone with dashboard (admin) access, or read access to the D1 database, can read every token. Old hash-only tokens are marked *not viewable* and can be **replaced** in place: new value, same name, grants and owner, subscriptions moved over.
+
+Each push subscription remembers the token it was created with, and revoking that token (or removing its user) removes those devices, so a lost phone stops receiving notifications.
+
+The PWA stores topics and tokens in the device's `localStorage`. On iPhone the Home Screen app's storage and cookies are separate from Safari's. If the Access login completes in Safari instead of the installed app, Safari shows a one-time pairing code (8 characters, 10 minutes, only its hash stored) that the app trades at `POST /api/v1/pair` for the personal token.
 
 ## D1 layout: packed rows
 

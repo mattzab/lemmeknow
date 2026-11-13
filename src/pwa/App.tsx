@@ -1,4 +1,4 @@
-import type { Message } from "@shared/types";
+import type { MeInfo, Message } from "@shared/types";
 import { Bell, BellOff, BellRing, Check, ExternalLink, Inbox, PlusCircle, RefreshCw, Send, Share, SquarePlus, Trash2, TriangleAlert } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Logo } from "@/components/logo";
@@ -8,7 +8,8 @@ import { Card } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/input";
 import { ago, dateTime, PRIORITY_LABEL } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { api, ApiError, currentSubscription, ensurePushSubscription, isAndroid, isIOS, isStandalone, loadSaved, permission, pushSupported, type SavedTopic, storeSaved } from "./push";
+import { AccountCard, AccountChip, LoginCard } from "./Account";
+import { api, ApiError, currentSubscription, ensurePushSubscription, isAndroid, isIOS, isStandalone, loadAccount, loadSaved, permission, pushSupported, type SavedTopic, sessionMe, storeAccount, storeSaved } from "./push";
 
 type Notice = { kind: "ok" | "error"; text: string } | null;
 
@@ -105,7 +106,7 @@ function PermissionHelp({ state }: { state: ReturnType<typeof permission> }) {
 	return null;
 }
 
-function AddTopic({ onAdd, busy }: { onAdd: (topic: string, token: string) => void; busy: boolean }) {
+function AddTopic({ onAdd, busy, signedIn }: { onAdd: (topic: string, token: string) => void; busy: boolean; signedIn: boolean }) {
 	const [topic, setTopic] = useState("");
 	const [token, setToken] = useState("");
 	return (
@@ -119,7 +120,7 @@ function AddTopic({ onAdd, busy }: { onAdd: (topic: string, token: string) => vo
 			<Field label="Topic" htmlFor="topic" hint="The topic name from your Lemmeknow dashboard.">
 				<Input id="topic" value={topic} onChange={(e) => setTopic(e.target.value)} placeholder="alerts" autoCapitalize="off" autoCorrect="off" spellCheck={false} className="font-mono" required />
 			</Field>
-			<Field label="Token" htmlFor="token" hint="A token with read access (lk_…). Leave empty for a public topic. It stays on this device.">
+			<Field label="Token" htmlFor="token" hint={signedIn ? "Leave empty to use your own token. Or paste another token (lk_…). It stays on this device." : "A token with read access (lk_…). Leave empty for a public topic. It stays on this device."}>
 				<Input id="token" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="lk_…" autoCapitalize="off" autoCorrect="off" spellCheck={false} className="font-mono" autoComplete="off" />
 			</Field>
 			<Button type="submit" loading={busy} disabled={!topic.trim()}>
@@ -166,6 +167,56 @@ export default function App() {
 	const now = useNow(30_000);
 	const standalone = isStandalone();
 	const canPush = pushSupported() && (!isIOS() || standalone);
+	const [account, setAccount] = useState<MeInfo | null>(loadAccount);
+	const [session, setSession] = useState(false);
+	const [accountOpen, setAccountOpen] = useState(() => new URLSearchParams(location.search).has("signed_in"));
+
+	const saveAccount = useCallback((me: MeInfo | null) => {
+		setAccount(me);
+		storeAccount(me);
+	}, []);
+
+	/** Swap the token on topics saved with the old personal token (after rotation or a grant change). */
+	const swapToken = useCallback((from: string | undefined, to: string) => {
+		if (!from || from === to) return;
+		const cur = loadSaved();
+		storeSaved({ ...cur, topics: cur.topics.map((t) => (t.token === from ? { ...t, token: to } : t)) });
+		setTopics(loadSaved().topics);
+	}, []);
+
+	// Who is signed in: the Access cookie first (this browser), else a token paired from Safari.
+	useEffect(() => {
+		const params = new URLSearchParams(location.search);
+		if (params.has("signed_in")) history.replaceState(null, "", "/");
+		void (async () => {
+			const prev = loadAccount();
+			try {
+				const me = await sessionMe();
+				if (typeof me === "object") {
+					setSession(true);
+					swapToken(prev?.token, me.token);
+					saveAccount(me);
+					if (params.has("signed_in")) setNotice({ kind: "ok", text: `Signed in as ${me.email}.` });
+					return;
+				}
+				if (me === "not-invited" && params.has("signed_in")) setNotice({ kind: "error", text: "You signed in, but this address has not been invited. Ask an admin to add you." });
+				if (prev) {
+					const fresh = await api.me(prev.token);
+					swapToken(prev.token, fresh.token);
+					saveAccount(fresh);
+				} else if (params.has("signed_in") && me === "signed-out") {
+					setNotice({
+						kind: "error",
+						text: isIOS() && standalone ? "The login finished outside the app. Open Lemmeknow in Safari, tap your name → Code for Home Screen app, and enter the code here." : "Login did not finish. Try again.",
+					});
+					setAccountOpen(true);
+				}
+			} catch (e) {
+				// A revoked token or removed user signs this device out; network errors keep the saved state.
+				if (e instanceof ApiError && (e.status === 401 || e.status === 403)) saveAccount(null);
+			}
+		})();
+	}, []);
 
 	const persist = useCallback((next: SavedTopic[], endpoint?: string) => {
 		setTopics(next);
@@ -229,8 +280,9 @@ export default function App() {
 		}
 	}
 
-	async function addTopic(topic: string, token: string) {
+	async function addTopic(topic: string, tokenIn: string) {
 		setNotice(null);
+		const token = tokenIn || account?.token || "";
 		// Ask for permission first, straight from the tap: iOS only shows the prompt for a user gesture.
 		let granted = permission() === "granted";
 		if (canPush && permission() === "default") {
@@ -304,6 +356,20 @@ export default function App() {
 		}
 	}
 
+	async function logout() {
+		if (!account) return;
+		const mine = loadSaved().topics.filter((t) => t.token === account.token);
+		if (mine.length && !confirm(`Log out? ${mine.map((t) => t.topic).join(", ")} will be removed from this device.`)) return;
+		const sub = await currentSubscription().catch(() => null);
+		if (sub) await Promise.allSettled(mine.filter((t) => t.push).map((t) => api.unsubscribe(t.topic, sub.endpoint)));
+		persist(loadSaved().topics.filter((t) => t.token !== account.token));
+		setMessages((m) => m?.filter((x) => !mine.some((t) => t.topic === x.topic)) ?? null);
+		saveAccount(null);
+		setAccountOpen(false);
+		// End the Cloudflare Access session too, so the next person on this browser has to log in.
+		if (session) location.href = "/cdn-cgi/access/logout";
+	}
+
 	return (
 		<div className="mx-auto min-h-dvh max-w-xl px-4 pb-10" style={{ paddingTop: "max(env(safe-area-inset-top), 1rem)" }}>
 			<header className="flex items-center gap-2 py-3">
@@ -311,16 +377,42 @@ export default function App() {
 				<span className="text-lg font-semibold tracking-tight">Lemmeknow</span>
 				<span
 					className={cn(
-						"ml-auto inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs",
+						"ml-auto inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-xs",
 						canPush && perm === "granted" ? "border-emerald-500/40 text-emerald-600 dark:text-emerald-400" : "text-muted-foreground",
 					)}
 				>
 					{canPush && perm === "granted" ? <Bell className="size-3" /> : <BellOff className="size-3" />}
-					{canPush && perm === "granted" ? "Notifications on" : "Notifications off"}
+					<span className="hidden min-[420px]:inline">Notifications</span>
+					{canPush && perm === "granted" ? "on" : "off"}
 				</span>
+				<AccountChip account={account} open={accountOpen} onToggle={() => setAccountOpen((o) => !o)} />
 			</header>
 
 			<div className="grid gap-4">
+				{accountOpen &&
+					(account ? (
+						<AccountCard
+							account={account}
+							session={session}
+							onDevice={new Set(topics.map((t) => t.topic))}
+							busy={busy}
+							onAddTopic={(t) => void addTopic(t, account.token)}
+							onRotated={(me) => {
+								swapToken(account.token, me.token);
+								saveAccount(me);
+							}}
+							onLogout={() => void logout()}
+							onClose={() => setAccountOpen(false)}
+						/>
+					) : (
+						<LoginCard
+							onPaired={(me) => {
+								saveAccount(me);
+								setNotice({ kind: "ok", text: `Signed in as ${me.email}. Add your topics below.` });
+							}}
+							onClose={() => setAccountOpen(false)}
+						/>
+					))}
 				{isIOS() && !standalone && <InstallIOS />}
 				{isAndroid() && !standalone && <InstallAndroid prompt={installPrompt} />}
 				{(!isIOS() || standalone) && <PermissionHelp state={perm} />}
@@ -371,7 +463,7 @@ export default function App() {
 							<PlusCircle className="size-4" /> Add a topic
 						</summary>
 						<div className="mt-3">
-							<AddTopic onAdd={(a, b) => void addTopic(a, b)} busy={busy === "add"} />
+							<AddTopic onAdd={(a, b) => void addTopic(a, b)} busy={busy === "add"} signedIn={!!account} />
 						</div>
 					</details>
 				</Card>

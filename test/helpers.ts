@@ -17,6 +17,7 @@ export async function fakeEnv(overrides: Partial<Env> = {}) {
 		ACCESS_AUD: "",
 		RETENTION_SECONDS: String(7 * 86400),
 		VAPID_SUBJECT: "",
+		ADMIN_EMAILS: "",
 		...overrides,
 	} satisfies Env;
 	resetSchemaFlag();

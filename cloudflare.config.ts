@@ -23,6 +23,8 @@ type LemmeknowConfig = {
 	retentionDays?: string;
 	/** Optional VAPID contact for push services: mailto:you@example.com or an https URL. Defaults to baseUrl. */
 	vapidSubject?: string;
+	/** Owner e-mails (comma separated), always admins. Keep them in the gitignored config file. */
+	adminEmails?: string;
 };
 
 const FILE = new URL("./lemmeknow.config.json", import.meta.url);
@@ -37,6 +39,7 @@ const cfg: LemmeknowConfig = {
 	accessAud: env("LEMMEKNOW_ACCESS_AUD") ?? file.accessAud ?? "",
 	retentionDays: env("LEMMEKNOW_RETENTION_DAYS") ?? file.retentionDays ?? "7",
 	vapidSubject: env("LEMMEKNOW_VAPID_SUBJECT") ?? file.vapidSubject ?? "",
+	adminEmails: env("LEMMEKNOW_ADMIN_EMAILS") ?? file.adminEmails ?? "",
 };
 if (!existsSync(FILE) && !env("LEMMEKNOW_ACCOUNT_ID")) {
 	console.warn("[lemmeknow] No lemmeknow.config.json found; using example.com placeholders (fine for `cf dev`, not for deploy).");
@@ -55,7 +58,7 @@ export default defineConfig({
 			notFoundHandling: "single-page-application",
 			// The PWA (/, /sw.js, manifest, icons, /assets/*) is plain static content. The Worker runs
 			// only for the APIs, the Access-gated dashboard, and the health probe.
-			runWorkerFirst: ["/api/*", "/admin", "/admin/*", "/admin.html", "/healthz"],
+			runWorkerFirst: ["/api/*", "/admin", "/admin/*", "/admin.html", "/login", "/access/*", "/healthz"],
 		},
 		domains: [cfg.host],
 		workersDev: false,
@@ -71,6 +74,7 @@ export default defineConfig({
 			ACCESS_AUD: bindings.text(cfg.accessAud),
 			RETENTION_SECONDS: bindings.text(String(retentionSeconds)),
 			VAPID_SUBJECT: bindings.text(cfg.vapidSubject ?? ""),
+			ADMIN_EMAILS: bindings.text(cfg.adminEmails ?? ""),
 			// No secrets: the VAPID key pair is generated on first use and kept in D1.
 		},
 	},

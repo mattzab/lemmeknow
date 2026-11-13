@@ -31,10 +31,41 @@ export interface TokenInfo {
 	id: string;
 	label: string;
 	prefix: string;
+	/** The full token, always copyable. null for tokens created before 0.3 (only a hash was kept): replace those. */
+	token: string | null;
 	grants: Grant[];
+	/** The user this token belongs to (null for tokens not tied to a person, e.g. a script). */
+	user_email: string | null;
+	/** A user's personal token: what the signed-in web app uses. Its grants follow the user's. */
+	personal: boolean;
 	created_at: number;
 	last_used_at: number | null;
 	expires_at: number | null;
+}
+
+export type Role = "admin" | "member";
+
+export interface UserInfo {
+	email: string;
+	role: Role;
+	/** Topic grants for members. Admins can read and write every topic. */
+	grants: Grant[];
+	/** "config": an owner listed in adminEmails (cannot be removed from the dashboard). */
+	source: "config" | "dashboard";
+	created_at: number | null;
+	added_by: string | null;
+	tokens: number;
+}
+
+/** The signed-in person, as the web app sees them (GET /api/me). */
+export interface MeInfo {
+	email: string;
+	role: Role;
+	/** Personal token for the web app and for curl. Always the full value. */
+	token: string;
+	grants: Grant[];
+	/** Topics this person can read, with whether they can publish to each. */
+	topics: { name: string; description: string; can_write: boolean }[];
 }
 
 export interface TopicInfo {
@@ -57,6 +88,11 @@ export interface ServerInfo {
 	baseUrl: string;
 	retentionSeconds: number;
 	email: string;
+	/** Owners from adminEmails config (empty: first signed-in person bootstraps as admin). */
+	configAdmins: string[];
+	/** Public URLs to paste into the Access policy's External Evaluation rule. */
+	accessEvaluateUrl: string;
+	accessKeysUrl: string;
 	version: string;
 	vapidPublicKey: string;
 }

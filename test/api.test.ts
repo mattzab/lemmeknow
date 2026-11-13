@@ -192,7 +192,7 @@ describe("dashboard API", () => {
 		expect((await s.call("/admin", {}, LOCAL)).status).toBe(200);
 	});
 
-	it("mints tokens shown once, sends test pushes, and revoking a token removes its devices", async () => {
+	it("mints tokens that stay viewable, sends test pushes, and revoking a token removes its devices", async () => {
 		const s = await setup();
 		stubPushServices();
 		const created = (await (await s.call("/api/admin/tokens", json({ label: "iPhone", grants: [{ topic: "alerts", read: true, write: true }] }), LOCAL)).json()) as {
@@ -200,7 +200,9 @@ describe("dashboard API", () => {
 			info: { id: string; prefix: string };
 		};
 		expect(created.token).toMatch(/^lk_[a-z0-9]{32}$/);
-		expect(JSON.stringify(s.sql.prepare("SELECT * FROM tokens").all())).not.toContain(created.token);
+		// Tokens stay copyable from the dashboard and never expire.
+		const tokens = (await (await s.call("/api/admin/tokens", {}, LOCAL)).json()) as { id: string; token: string | null; expires_at: number | null }[];
+		expect(tokens.find((t) => t.id === created.info.id)).toMatchObject({ token: created.token, expires_at: null });
 		const auth = { authorization: `Bearer ${created.token}` };
 
 		const dev = await fakeBrowserSubscription();

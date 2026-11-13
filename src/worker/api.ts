@@ -1,9 +1,10 @@
 import type { PushSubscriptionJSON } from "@shared/types";
 import { Hono } from "hono";
-import { AuthError, authorize } from "./auth";
+import { AuthError, authorize, bearerToken, hashToken } from "./auth";
 import { type Env, VERSION } from "./env";
 import { buildMessage, InputError, type PublishInput, publish, retentionSeconds, vapidSubject } from "./service";
-import { addSubscription, getVapidKeys, listMessages, MAX_LIST, removeSubscriptions, TooManySubscriptions } from "./store";
+import { meInfo, normCode, resolvePerson } from "./people";
+import { addSubscription, consumePairCode, findTokenByHash, getVapidKeys, listMessages, MAX_LIST, removeSubscriptions, TooManySubscriptions } from "./store";
 import { isValidTopic, nowSec, sha256Hex } from "./util";
 import { isAcceptableEndpoint } from "./webpush";
 
@@ -17,6 +18,8 @@ import { isAcceptableEndpoint } from "./webpush";
  *   GET    /api/v1/topics/:topic/messages?since=&limit=  inbox, newest first (read)
  *   POST   /api/v1/topics/:topic/subscriptions           register this device for Web Push (read)
  *   DELETE /api/v1/topics/:topic/subscriptions           unregister (knowing the endpoint is enough)
+ *   GET    /api/v1/me                                    personal token → its person and topics
+ *   POST   /api/v1/pair                                  trade a one-time code from a signed-in browser for its person's token
  */
 export const api = new Hono<{ Bindings: Env }>();
 
@@ -137,6 +140,31 @@ api.delete("/topics/:topic/subscriptions", async (c) => {
 	if (typeof endpoint !== "string" || !endpoint) throw new InputError("Send the subscription endpoint to remove.", "endpoint");
 	const removed = await removeSubscriptions(c.env.DB, topic, [endpoint]);
 	return c.json({ removed });
+});
+
+/**
+ * Body `{ code }`. The Home Screen app on iPhone has its own cookies, so when someone signs in
+ * with Access in Safari instead, Safari shows a code that the app trades here for the personal
+ * token. Codes are one-time and expire after 10 minutes; only their SHA-256 is stored.
+ */
+api.post("/pair", async (c) => {
+	const b = await readJson<{ code?: unknown }>(c.req.raw);
+	const code = typeof b.code === "string" ? normCode(b.code) : "";
+	if (code.length !== 8) throw new InputError("Enter the 8-character code.", "code");
+	const email = await consumePairCode(c.env.DB, await sha256Hex(code), nowSec());
+	const person = email ? await resolvePerson(c.env, email) : null;
+	if (!person) return c.json({ error: "That code is wrong, used, or expired. Get a new one." }, 400);
+	return c.json(await meInfo(c.env, person));
+});
+
+/** With a personal token: who it belongs to and their topics (the paired Home Screen app uses this). */
+api.get("/me", async (c) => {
+	const raw = bearerToken(c.req.raw);
+	const row = raw ? await findTokenByHash(c.env.DB, await hashToken(raw)) : null;
+	if (!row) throw new AuthError(401, "Unknown or revoked token.");
+	const person = row.personal && row.user_email ? await resolvePerson(c.env, row.user_email) : null;
+	if (!person) throw new AuthError(403, "Not a personal token of a current user.");
+	return c.json(await meInfo(c.env, person));
 });
 
 api.all("*", (c) => c.json({ error: "Not found" }, 404));

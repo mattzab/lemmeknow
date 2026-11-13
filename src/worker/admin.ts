@@ -1,8 +1,7 @@
-import type { Grant, ServerInfo } from "@shared/types";
+import type { Grant, Role, ServerInfo, UserInfo } from "@shared/types";
 import { Hono } from "hono";
-import { type AccessIdentity, authenticate } from "./access";
-import { generateToken, hashToken, TOKEN_PREFIX } from "./auth";
 import { type Env, VERSION } from "./env";
+import { configAdmins, ensurePersonalToken, mintToken, normEmail, type Person, personFromRequest, removePerson, replaceToken, resolvePerson } from "./people";
 import { baseUrlFor, buildMessage, fanOut, InputError, publish, retentionSeconds, vapidSubject } from "./service";
 import {
 	deleteToken,
@@ -10,26 +9,32 @@ import {
 	getSubscriptions,
 	getTopic,
 	getVapidKeys,
+	getToken,
+	getUser,
 	insertMessage,
-	insertToken,
 	listMessages,
+	listUserRows,
 	listTokens,
 	listTopics,
 	removeSubscriptionsByToken,
+	tokenCounts,
 	tokenInfo,
 	updateToken,
 	upsertTopic,
+	upsertUser,
 } from "./store";
-import { isValidTopic, nowSec, randomString } from "./util";
+import { isValidTopic, nowSec } from "./util";
 
-type Vars = { identity: AccessIdentity };
+type Vars = { person: Person };
 export const admin = new Hono<{ Bindings: Env; Variables: Vars }>();
 
-// Every admin call needs a valid Cloudflare Access JWT (localhost dev excepted, see access.ts).
+// Every admin call needs a valid Cloudflare Access JWT (localhost dev excepted, see access.ts)
+// from an admin. Invited members pass Access too, but only get /api/me.
 admin.use("*", async (c, next) => {
-	const id = await authenticate(c.req.raw, c.env);
-	if (!id) return c.json({ error: "Cloudflare Access authentication required" }, 401);
-	c.set("identity", id);
+	const { person, email } = await personFromRequest(c.req.raw, c.env);
+	if (!email) return c.json({ error: "Cloudflare Access authentication required" }, 401);
+	if (!person || person.role !== "admin") return c.json({ error: "Only admins can use the dashboard." }, 403);
+	c.set("person", person);
 	await next();
 	c.header("cache-control", "no-store");
 });
@@ -46,9 +51,12 @@ admin.get("/me", async (c) => {
 	const info: ServerInfo = {
 		baseUrl: baseUrlFor(c.env, c.req.raw),
 		retentionSeconds: retentionSeconds(c.env),
-		email: c.get("identity").email,
+		email: c.get("person").email,
 		version: VERSION,
 		vapidPublicKey: (await getVapidKeys(c.env.DB)).publicKey,
+		configAdmins: configAdmins(c.env),
+		accessEvaluateUrl: `${baseUrlFor(c.env, c.req.raw)}/access/evaluate`,
+		accessKeysUrl: `${baseUrlFor(c.env, c.req.raw)}/access/keys`,
 	};
 	return c.json(info);
 });
@@ -107,26 +115,22 @@ function cleanGrants(raw: unknown): Grant[] | string {
 admin.get("/tokens", async (c) => c.json(await listTokens(c.env.DB)));
 
 admin.post("/tokens", async (c) => {
-	const b = await c.req.json<{ label?: string; grants?: unknown; expires_in_days?: number | null }>();
+	const b = await c.req.json<{ label?: string; grants?: unknown; user_email?: string | null }>();
 	const label = (b.label ?? "").trim();
 	if (!label) return c.json(bad("Give the token a name, e.g. the device or script that uses it.", "label"), 400);
 	const grants = cleanGrants(b.grants ?? []);
 	if (typeof grants === "string") return c.json(bad(grants, "grants"), 400);
-	const now = nowSec();
-	const token = generateToken();
-	const row = {
-		id: randomString(16),
-		label,
-		token_hash: await hashToken(token),
-		prefix: token.slice(0, TOKEN_PREFIX.length + 4),
-		grants: JSON.stringify(grants),
-		created_at: now,
-		last_used_at: null,
-		expires_at: b.expires_in_days ? now + Math.round(b.expires_in_days * 86400) : null,
-	};
-	await insertToken(c.env.DB, row);
-	// The plaintext token is returned exactly once; only its SHA-256 is stored.
-	return c.json({ token, info: tokenInfo(row) }, 201);
+	const user_email = b.user_email ? normEmail(b.user_email) : null;
+	// Tokens never expire and stay copyable: the full value is stored (only admins can read it).
+	const row = await mintToken(c.env, { label, grants, user_email });
+	return c.json({ token: row.token, info: tokenInfo(row) }, 201);
+});
+
+/** New value, same name, grants and owner. Devices subscribed with the old value move over. */
+admin.post("/tokens/:id/replace", async (c) => {
+	const row = await replaceToken(c.env, c.req.param("id"));
+	if (!row) return c.json(bad("Token not found"), 404);
+	return c.json({ token: row.token, info: tokenInfo(row) });
 });
 
 admin.patch("/tokens/:id", async (c) => {
@@ -137,6 +141,8 @@ admin.patch("/tokens/:id", async (c) => {
 		patch.label = b.label.trim();
 	}
 	if (b.grants !== undefined) {
+		const cur = await getToken(c.env.DB, c.req.param("id"));
+		if (cur?.personal) return c.json(bad("A personal token follows its user's grants: change them on the Users page.", "grants"), 400);
 		const g = cleanGrants(b.grants);
 		if (typeof g === "string") return c.json(bad(g, "grants"), 400);
 		patch.grants = g;
@@ -151,6 +157,68 @@ admin.delete("/tokens/:id", async (c) => {
 	// Devices that subscribed with this token stop receiving pushes too.
 	const devices = await removeSubscriptionsByToken(c.env.DB, id);
 	return c.json({ ok: true, devices_removed: devices });
+});
+
+// ---------- users ----------
+
+admin.get("/users", async (c) => {
+	const [rows, counts] = await Promise.all([listUserRows(c.env.DB), tokenCounts(c.env.DB)]);
+	const owners = configAdmins(c.env);
+	const out: UserInfo[] = owners.map((email) => ({ email, role: "admin", grants: [], source: "config", created_at: null, added_by: null, tokens: counts[email] ?? 0 }));
+	for (const r of rows) {
+		if (owners.includes(r.email)) continue;
+		out.push({ email: r.email, role: r.role, grants: r.role === "admin" ? [] : (JSON.parse(r.grants) as Grant[]), source: "dashboard", created_at: r.created_at, added_by: r.added_by, tokens: counts[r.email] ?? 0 });
+	}
+	return c.json(out);
+});
+
+const EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+
+function cleanUser(b: { role?: unknown; grants?: unknown }): { role: Role; grants: Grant[] } | string {
+	const role: Role = b.role === "admin" ? "admin" : "member";
+	const grants = role === "admin" ? [] : cleanGrants(b.grants ?? []);
+	return typeof grants === "string" ? grants : { role, grants };
+}
+
+/** Invite someone. Access lets them sign in via the External Evaluation rule (see /access/evaluate). */
+admin.post("/users", async (c) => {
+	const b = await c.req.json<{ email?: string; role?: string; grants?: unknown }>();
+	const email = normEmail(b.email ?? "");
+	if (!EMAIL_RE.test(email) || email.length > 254) return c.json(bad("Enter an e-mail address.", "email"), 400);
+	if (configAdmins(c.env).includes(email) || (await getUser(c.env.DB, email))) return c.json(bad("That person is already a user.", "email"), 409);
+	const u = cleanUser(b);
+	if (typeof u === "string") return c.json(bad(u, "grants"), 400);
+	const me = c.get("person");
+	const now = nowSec();
+	// Bootstrap ends here: whoever invites the first person is recorded as an admin.
+	if (me.bootstrap) await upsertUser(c.env.DB, { email: me.email, role: "admin", grants: [], added_by: null }, now);
+	await upsertUser(c.env.DB, { email, ...u, added_by: me.email }, now);
+	return c.json({ ok: true }, 201);
+});
+
+admin.patch("/users/:email", async (c) => {
+	const email = normEmail(c.req.param("email"));
+	if (configAdmins(c.env).includes(email)) return c.json(bad("Owners are set in adminEmails (lemmeknow.config.json), not here."), 400);
+	const cur = await getUser(c.env.DB, email);
+	if (!cur) return c.json(bad("User not found"), 404);
+	if (email === c.get("person").email) return c.json(bad("You cannot change your own role."), 400);
+	const b = await c.req.json<{ role?: string; grants?: unknown }>();
+	const u = cleanUser({ role: b.role ?? cur.role, grants: b.grants ?? JSON.parse(cur.grants) });
+	if (typeof u === "string") return c.json(bad(u, "grants"), 400);
+	await upsertUser(c.env.DB, { email, ...u, added_by: cur.added_by }, cur.created_at);
+	// Keep their personal token in step with the new grants.
+	const p = await resolvePerson(c.env, email);
+	if (p) await ensurePersonalToken(c.env, p);
+	return c.json({ ok: true });
+});
+
+/** Remove someone: they can no longer sign in, and their tokens and devices are revoked. */
+admin.delete("/users/:email", async (c) => {
+	const email = normEmail(c.req.param("email"));
+	if (configAdmins(c.env).includes(email)) return c.json(bad("Owners are set in adminEmails (lemmeknow.config.json), not here."), 400);
+	if (email === c.get("person").email) return c.json(bad("You cannot remove yourself."), 400);
+	if (!(await getUser(c.env.DB, email))) return c.json(bad("User not found"), 404);
+	return c.json({ ok: true, ...(await removePerson(c.env, email)) });
 });
 
 // ---------- messages ----------

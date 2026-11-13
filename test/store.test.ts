@@ -24,7 +24,7 @@ describe("store", () => {
 		f.sql.exec("INSERT INTO tokens (id, label, token_hash, prefix, created_at) VALUES ('t', 'phone', 'h', 'tk_a', 1)");
 		await ensureSchema(d1);
 		const tables = (f.sql.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
-		expect(tables).toEqual(["inbox", "push_subs", "settings", "tokens", "topics"]);
+		expect(tables).toEqual(["inbox", "pair_codes", "push_subs", "settings", "tokens", "topics", "users"]);
 		expect(f.sql.prepare("SELECT value FROM settings WHERE key = 'schema_version'").get()).toEqual({ value: String(MIGRATIONS.length) });
 		expect(f.sql.prepare("SELECT COUNT(*) AS n FROM topics").get()).toEqual({ n: 1 });
 		expect(f.sql.prepare("SELECT COUNT(*) AS n FROM tokens").get()).toEqual({ n: 1 });
